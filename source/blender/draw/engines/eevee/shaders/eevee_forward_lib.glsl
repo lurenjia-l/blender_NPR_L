@@ -12,6 +12,11 @@
 
 #include "draw_model_lib.glsl"
 #include "eevee_colorspace_lib.glsl"
+#ifndef EEVEE_LIGHTGROUP_ID_DECLARED
+int g_active_lightgroup_id = 0;
+#define EEVEE_LIGHTGROUP_ID_DECLARED
+#endif
+
 #include "eevee_light_eval_lib.glsl"
 #include "eevee_lightprobe_eval_lib.glsl"
 #include "eevee_nodetree_closures_lib.glsl"

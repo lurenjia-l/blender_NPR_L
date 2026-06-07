@@ -31,13 +31,13 @@ static void node_declare(NodeDeclarationBuilder &b)
       .default_value({2.757f, 2.513f, 2.231f})
       .min(0.0f)
       .max(100.0f)
-      .description("Real part of the conductor's refractive index, often called n")
+      .description("Real part of the conductor''s refractive index, often called n")
       .make_available([](bNode &node) { node.custom2 = SHD_PHYSICAL_CONDUCTOR; });
   b.add_input<decl::Vector>("Extinction")
       .default_value({3.867f, 3.404f, 3.009f})
       .min(0.0f)
       .max(100.0f)
-      .description("Imaginary part of the conductor's refractive index, often called k")
+      .description("Imaginary part of the conductor''s refractive index, often called k")
       .make_available([](bNode &node) { node.custom2 = SHD_PHYSICAL_CONDUCTOR; });
   b.add_input<decl::Float>("Roughness")
       .default_value(0.5f)
@@ -64,6 +64,10 @@ static void node_declare(NodeDeclarationBuilder &b)
   b.add_input<decl::Vector>("Normal").hide_value();
   b.add_input<decl::Vector>("Tangent").hide_value();
   b.add_input<decl::Float>("Weight").available(false);
+  b.add_input<decl::Int>("Lightgroup ID")
+      .default_value(0)
+      .min(0)
+      .description("Only lights in this lightgroup illuminate this BSDF. 0 matches all lights");
 
   PanelDeclarationBuilder &film = b.add_panel("Thin Film").default_closed(true);
   film.add_input<decl::Float>("Thin Film Thickness")
@@ -114,6 +118,12 @@ static int node_shader_gpu_bsdf_metallic(GPUMaterial *mat,
     if (in[2].might_be_tinted() || in[3].might_be_tinted()) {
       GPU_material_flag_set(mat, GPU_MATFLAG_REFLECTION_MAYBE_COLORED);
     }
+  }
+
+  /* If socket is connected, disable lightgroup filtering (force 0). */
+  if (in[10].link != nullptr) {
+    in[10].link = nullptr;
+    in[10].vec[0] = 0.0f;
   }
 
   return GPU_stack_link(mat,

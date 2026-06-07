@@ -31,6 +31,7 @@ void node_bsdf_metallic(float4 base_color,
                         float3 N,
                         float3 T,
                         float weight,
+                        const float lightgroup_id,
                         float thin_film_thickness,
                         float thin_film_ior,
                         const float do_multiscatter,
@@ -52,6 +53,9 @@ void node_bsdf_metallic(float4 base_color,
   /* Not used by EEVEE */
   /* anisotropy = saturate(anisotropy); */
 
+#ifdef EEVEE_LIGHTGROUP_ID_DECLARED
+  g_active_lightgroup_id = int(round(lightgroup_id));
+#endif
   N = safe_normalize(N);
   float3 V = coordinate_incoming(g_data.P);
   float NV = dot(N, V);

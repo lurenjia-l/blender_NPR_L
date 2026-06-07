@@ -18,6 +18,10 @@ static void node_declare(NodeDeclarationBuilder &b)
       .subtype(PROP_FACTOR);
   b.add_input<decl::Vector>("Normal").hide_value();
   b.add_input<decl::Float>("Weight").available(false);
+  b.add_input<decl::Int>("Lightgroup ID")
+      .default_value(0)
+      .min(0)
+      .description("Only lights in this lightgroup illuminate this BSDF. 0 matches all lights");
   b.add_output<decl::Shader>("BSDF");
 }
 
@@ -33,7 +37,17 @@ static int node_shader_gpu_bsdf_diffuse(GPUMaterial *mat,
 
   GPU_material_flag_set(mat, GPU_MATFLAG_DIFFUSE);
 
-  return GPU_stack_link(mat, node, "node_bsdf_diffuse", in, out);
+  /* If socket is connected, disable lightgroup filtering (force 0). */
+  if (in[4].link != nullptr) {
+    in[4].link = nullptr;
+    in[4].vec[0] = 0.0f;
+  }
+
+  return GPU_stack_link(mat,
+                        node,
+                        "node_bsdf_diffuse",
+                        in,
+                        out);
 }
 
 NODE_SHADER_MATERIALX_BEGIN

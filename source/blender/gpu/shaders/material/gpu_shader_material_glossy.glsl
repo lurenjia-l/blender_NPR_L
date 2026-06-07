@@ -13,6 +13,7 @@ void node_bsdf_glossy(float4 color,
                       float3 N,
                       float3 T,
                       float weight,
+                      const float lightgroup_id,
                       const float do_multiscatter,
                       Closure &result)
 {
@@ -24,6 +25,9 @@ void node_bsdf_glossy(float4 color,
   float3 V = coordinate_incoming(g_data.P);
   float NV = dot(N, V);
 
+#ifdef EEVEE_LIGHTGROUP_ID_DECLARED
+  g_active_lightgroup_id = int(round(lightgroup_id));
+#endif
   float2 split_sum = brdf_lut(NV, roughness);
 
   ClosureReflection reflection_data;

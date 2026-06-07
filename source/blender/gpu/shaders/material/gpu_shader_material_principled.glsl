@@ -37,6 +37,7 @@ void node_bsdf_principled(float4 base_color,
                           float alpha,
                           float3 N,
                           float weight,
+                          const float lightgroup_id,
                           float diffuse_roughness,
                           float subsurface_weight,
                           float3 subsurface_radius,
@@ -64,6 +65,9 @@ void node_bsdf_principled(float4 base_color,
                           const float do_multiscatter,
                           Closure &result)
 {
+#ifdef EEVEE_LIGHTGROUP_ID_DECLARED
+  g_active_lightgroup_id = int(round(lightgroup_id));
+#endif
   /* Match cycles. */
   metallic = saturate(metallic);
   roughness = saturate(roughness);

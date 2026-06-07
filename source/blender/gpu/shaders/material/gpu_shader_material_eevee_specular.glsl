@@ -16,9 +16,13 @@ void node_eevee_specular(float4 diffuse,
                          float clearcoat_roughness,
                          float3 CN,
                          float weight,
+                         const float lightgroup_id,
                          const float use_clearcoat,
                          Closure &result)
 {
+#ifdef EEVEE_LIGHTGROUP_ID_DECLARED
+  g_active_lightgroup_id = int(round(lightgroup_id));
+#endif
   diffuse = max(diffuse, float4(0));
   specular = max(specular, float4(0));
   roughness = saturate(roughness);

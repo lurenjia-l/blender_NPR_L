@@ -38,6 +38,10 @@ static void node_declare(NodeDeclarationBuilder &b)
       .subtype(PROP_FACTOR);
   b.add_input<decl::Vector>("Clear Coat Normal").hide_value();
   b.add_input<decl::Float>("Weight").available(false);
+  b.add_input<decl::Int>("Lightgroup ID")
+      .default_value(0)
+      .min(0)
+      .description("Only lights in this lightgroup illuminate this BSDF. 0 matches all lights");
   b.add_output<decl::Shader>("BSDF");
 }
 
@@ -77,7 +81,19 @@ static int node_shader_gpu_eevee_specular(GPUMaterial *mat,
   GPU_material_flag_set(mat, flag);
 
   float use_coat_f = use_coat ? 1.0f : 0.0f;
-  return GPU_stack_link(mat, node, "node_eevee_specular", in, out, GPU_constant(&use_coat_f));
+
+  /* If socket is connected, disable lightgroup filtering (force 0). */
+  if (in[10].link != nullptr) {
+    in[10].link = nullptr;
+    in[10].vec[0] = 0.0f;
+  }
+
+  return GPU_stack_link(mat,
+                        node,
+                        "node_eevee_specular",
+                        in,
+                        out,
+                        GPU_constant(&use_coat_f));
 }
 
 }  // namespace nodes::node_shader_eevee_specular_cc

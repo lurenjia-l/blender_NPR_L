@@ -5,8 +5,11 @@
 #include "gpu_shader_math_vector_safe_lib.glsl"
 
 [[node]]
-void node_bsdf_diffuse(float4 color, float roughness, float3 N, float weight, Closure &result)
+void node_bsdf_diffuse(float4 color, float roughness, float3 N, float weight, const float lightgroup_id, Closure &result)
 {
+#ifdef EEVEE_LIGHTGROUP_ID_DECLARED
+    g_active_lightgroup_id = int(round(lightgroup_id));
+#endif
   ClosureDiffuse diffuse_data;
   diffuse_data.weight = weight;
   diffuse_data.color = color.rgb;

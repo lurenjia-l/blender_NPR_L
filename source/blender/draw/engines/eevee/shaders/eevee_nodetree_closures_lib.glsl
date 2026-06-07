@@ -21,6 +21,11 @@ packed_float3 g_volume_scattering;
 float g_volume_anisotropy;
 packed_float3 g_volume_absorption;
 
+#ifndef EEVEE_LIGHTGROUP_ID_DECLARED
+int g_active_lightgroup_id = 0;
+#define EEVEE_LIGHTGROUP_ID_DECLARED
+#endif
+
 /* The Closure type is never used. Use float as dummy type. */
 #define Closure float
 #define CLOSURE_DEFAULT 0.0f
