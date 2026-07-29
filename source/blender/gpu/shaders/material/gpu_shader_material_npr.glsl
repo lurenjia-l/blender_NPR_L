@@ -232,3 +232,42 @@ void node_input_aov(float hash, TextureHandle &color, TextureHandle &value)
   value = TEXTURE_HANDLE_DEFAULT;
 #endif
 }
+
+/* NPR Bridge: pack a vector into a color (xyz -> rgb, alpha = 1) for storage in the color AOV
+ * buffer. */
+[[node]]
+void npr_bridge_vec_to_color(float3 vec, float4 &color)
+{
+  color = float4(vec, 1.0f);
+}
+
+/* NPR Bridge Input: read three bridged slots (color / float / vector) by hash in one call.
+ * Each slot is stored as a virtual AOV (see Film::init_aovs injection). Vector reuses the color
+ * buffer region; the downstream vector socket reads .rgb via TextureHandle_eval. */
+[[node]]
+void node_input_npr_bridge(float color_hash,
+                           float value_hash,
+                           float vector_hash,
+                           float same_chain,
+                           TextureHandle &color,
+                           TextureHandle &value,
+                           TextureHandle &vector,
+                           TextureHandle &shader)
+{
+#if (defined(NPR_SHADER) || defined(MAT_FILTER)) && defined(GPU_FRAGMENT_SHADER)
+  TextureHandle dummy;
+  input_aov_impl(floatBitsToUint(color_hash), color, dummy);
+  input_aov_impl(floatBitsToUint(value_hash), dummy, value);
+  input_aov_impl(floatBitsToUint(vector_hash), vector, dummy);
+  /* Same chain: return the fully-lit combined color (== BSDF into Material Output).
+   * Different chain: return black (Route A fallback; needs Route C for full lighting).
+   * TEX_HANDLE_COMBINED_COLOR=10, TEX_HANDLE_NULL=0 are #defined in
+   * eevee_surf_deferred_npr_frag.glsl and not visible from this material lib, so use raw values. */
+  shader = (same_chain != 0.0f) ? TextureHandle(10u, 0) : TextureHandle(0u, 0);
+#else
+  color = TEXTURE_HANDLE_DEFAULT;
+  value = TEXTURE_HANDLE_DEFAULT;
+  vector = TEXTURE_HANDLE_DEFAULT;
+  shader = TEXTURE_HANDLE_DEFAULT;
+#endif
+}

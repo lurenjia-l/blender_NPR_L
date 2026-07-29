@@ -69,8 +69,8 @@ static void node_declare(NodeDeclarationBuilder &b)
 #define SOCK_NORMAL_ID 5
   b.add_input<decl::Float>("Weight").available(false);
 #define SOCK_WEIGHT_ID 6
-  b.add_input<decl::Int>("Lightgroup ID").default_value(0).min(0)
-      .description("Only lights in this lightgroup illuminate this BSDF. 0 matches all lights");
+  b.add_input<decl::Int>("Lightgroup ID").default_value(-1).min(-1)
+      .description("Only lights in this lightgroup illuminate this BSDF");
 
 #define SOCK_LIGHTGROUP_ID 7
 
@@ -399,10 +399,10 @@ static int node_shader_gpu_bsdf_principled(GPUMaterial *mat,
     in[SOCK_TRANSMISSION_WEIGHT_ID].link = GPU_constant(&zero);
   }
 
-  /* If socket is connected, disable lightgroup filtering (force 0). */
+  /* If socket is connected, disable lightgroup filtering (force -1). */
   if (in[SOCK_LIGHTGROUP_ID].link != nullptr) {
     in[SOCK_LIGHTGROUP_ID].link = nullptr;
-    in[SOCK_LIGHTGROUP_ID].vec[0] = 0.0f;
+    in[SOCK_LIGHTGROUP_ID].vec[0] = -1.0f;
   }
 
   float use_multi_scatter = (node->custom1 == SHD_GLOSSY_MULTI_GGX) ? 1.0f : 0.0f;

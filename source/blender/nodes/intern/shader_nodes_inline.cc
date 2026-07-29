@@ -346,6 +346,7 @@ class ShaderNodesInliner {
           add_output_type("ShaderNodeOutputMaterial");
           add_output_type("ShaderNodeOutputLight");
           add_output_type("ShaderNodeOutputAOV");
+          add_output_type("ShaderNodeNPR_BridgeOutput");
           add_output_type("ShaderNodeOutlineControl");
         }
         break;

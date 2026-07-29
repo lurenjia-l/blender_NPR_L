@@ -75,6 +75,8 @@ void register_node_type_sh_oklab_color_ramp();
 void register_node_type_sh_npr_image_sample();
 void register_node_type_sh_npr_input();
 void register_node_type_sh_npr_output();
+void register_node_type_sh_npr_bridge_input();
+void register_node_type_sh_npr_bridge_output();
 void register_node_type_sh_npr_refraction();
 void register_node_type_sh_outline_control();
 void register_node_type_sh_output_filter();

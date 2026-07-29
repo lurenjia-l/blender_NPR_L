@@ -31,7 +31,7 @@ SHADER_LIBRARY_CREATE_INFO(eevee_light_data)
 #include "gpu_shader_utildefines_lib.glsl"
 
 #ifndef EEVEE_LIGHTGROUP_ID_DECLARED
-int g_active_lightgroup_id = 0;
+int g_active_lightgroup_id = -1;
 #define EEVEE_LIGHTGROUP_ID_DECLARED
 #endif
 
@@ -242,7 +242,7 @@ void light_eval_single(uint l_idx,
   if (!light_linking_affects_receiver(light.light_set_membership, receiver_light_set)) {
     return;
   }
-  if (g_active_lightgroup_id > 0 && light.lightgroup_id != g_active_lightgroup_id) {
+  if (g_active_lightgroup_id >= 0 && light.lightgroup_id != g_active_lightgroup_id) {
     return;
   }
 

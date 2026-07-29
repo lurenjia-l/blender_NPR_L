@@ -12,6 +12,10 @@
 
 #include "NOD_shader.h"
 
+#include "DNA_material_types.h"
+#include "DNA_node_types.h"
+#include "BLI_string.h"
+
 namespace blender {
 
 bNodeTree *BKE_npr_tree_add(Main *bmain, const char *name)
@@ -35,6 +39,29 @@ bNodeTree *BKE_npr_tree_add(Main *bmain, const char *name)
   bke::node_set_active(*ntree, *output);
   BKE_ntree_update_after_single_tree_change(*bmain, *ntree);
   return ntree;
+}
+
+void BKE_npr_bridge_socket_name(const Material *mat,
+                                const bNode *node,
+                                int socket_type,
+                                char *out,
+                                size_t out_len)
+{
+  const char *type_str = (socket_type == 0) ? "color" : (socket_type == 1) ? "float" : "vector";
+
+  char base[88];
+  const NodeShaderNPRBridge *storage = (const NodeShaderNPRBridge *)node->storage;
+  if (storage && storage->name[0] != '\0') {
+    BLI_strncpy(base, storage->name, sizeof(base));
+  }
+  else if (mat != nullptr) {
+    SNPRINTF(base, "%s_%s", mat->id.name + 2, node->name);
+  }
+  else {
+    SNPRINTF(base, "%s", node->name);
+  }
+
+  BLI_snprintf(out, out_len, "__nprbr__%s__%s", base, type_str);
 }
 
 }  // namespace blender

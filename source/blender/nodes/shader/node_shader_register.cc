@@ -76,6 +76,8 @@ void register_shader_nodes()
   register_node_type_sh_npr_image_sample();
   register_node_type_sh_npr_input();
   register_node_type_sh_npr_output();
+  register_node_type_sh_npr_bridge_input();
+  register_node_type_sh_npr_bridge_output();
   register_node_type_sh_npr_refraction();
   register_node_type_sh_outline_control();
   register_node_type_sh_output_filter();

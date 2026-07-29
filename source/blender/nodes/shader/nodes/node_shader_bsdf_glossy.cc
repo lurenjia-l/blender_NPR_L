@@ -30,8 +30,8 @@ static void node_declare(NodeDeclarationBuilder &b)
   b.add_input<decl::Float>("Weight").available(false);
   b.add_input<decl::Int>("Lightgroup ID")
       .default_value(0)
-      .min(0)
-      .description("Only lights in this lightgroup illuminate this BSDF. 0 matches all lights");
+      .min(-1)
+      .description("Only lights in this lightgroup illuminate this BSDF");
   b.add_output<decl::Shader>("BSDF");
 }
 
@@ -63,10 +63,10 @@ static int node_shader_gpu_bsdf_glossy(GPUMaterial *mat,
 
   float use_multi_scatter = (node->custom1 == SHD_GLOSSY_MULTI_GGX) ? 1.0f : 0.0f;
 
-  /* If socket is connected, disable lightgroup filtering (force 0). */
+  /* If socket is connected, disable lightgroup filtering (force -1). */
   if (in[7].link != nullptr) {
     in[7].link = nullptr;
-    in[7].vec[0] = 0.0f;
+    in[7].vec[0] = -1.0f;
   }
 
   return GPU_stack_link(mat,

@@ -22,7 +22,7 @@ float g_volume_anisotropy;
 packed_float3 g_volume_absorption;
 
 #ifndef EEVEE_LIGHTGROUP_ID_DECLARED
-int g_active_lightgroup_id = 0;
+int g_active_lightgroup_id = -1;
 #define EEVEE_LIGHTGROUP_ID_DECLARED
 #endif
 

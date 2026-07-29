@@ -31,6 +31,11 @@ struct bNode *ntreeShaderOutputNode(struct bNodeTree *ntree, int target);
 
 struct bNodeTree *npr_tree_get(struct bNodeTree *ntree);
 struct bNodeTree *npr_tree_get_from_mat(struct Material *material);
+
+/* NPR Bridge: returns true if the closure chain feeding the given Bridge Output's Shader input
+ * shares a source node (BSDF/leaf) with the Material Output Surface closure chain. Used to
+ * decide whether the Bridge Input Shader output can return g_combined_color. */
+bool npr_bridge_shader_same_chain(struct bNodeTree *mat_tree, struct bNode *bridge_output);
 struct bNodeTree *ntreeGPUNPRNodes(struct bNodeTree *material_tree, struct GPUMaterial *mat);
 void ntreeGPULightShaderNodes(struct bNodeTree *localtree, struct GPUMaterial *mat);
 

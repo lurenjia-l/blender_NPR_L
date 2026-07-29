@@ -6,6 +6,7 @@
  * \ingroup nodes
  */
 
+#include <cstdio>
 #include <cstring>
 
 #include "DNA_light_types.h"
@@ -991,7 +992,7 @@ static void ntree_shader_pruned_unused(bNodeTree *ntree, bNode *output_node)
   }
 
   for (bNode &node : ntree->nodes) {
-    if (ELEM(node.type_legacy, SH_NODE_OUTPUT_AOV, SH_NODE_OUTLINE_CONTROL)) {
+    if (ELEM(node.type_legacy, SH_NODE_OUTPUT_AOV, SH_NODE_NPR_BRIDGE_OUTPUT, SH_NODE_OUTLINE_CONTROL)) {
       node.runtime->tmp_flag = 1;
       bke::node_chain_iterator_backwards(ntree, &node, ntree_branch_node_tag, nullptr, 0);
     }
@@ -1028,6 +1029,66 @@ bNodeTree *npr_tree_get_from_mat(Material *material)
     return nullptr;
   }
   return npr_tree_get(material->nodetree);
+}
+
+/* Collect leaf closure source nodes (BSDF/Emission/etc.) feeding a Shader input socket,
+ * recursing through Mix Shader / Add Shader and skipping Reroute. */
+static void npr_bridge_collect_closure_sources(bNodeSocket *input_sock, Set<bNode *> &out)
+{
+  if (input_sock == nullptr || input_sock->link == nullptr) {
+    return;
+  }
+  bNode *from_node = input_sock->link->fromnode;
+  if (from_node == nullptr) {
+    return;
+  }
+  if (from_node->type_legacy == NODE_REROUTE) {
+    bNodeSocket *reroute_in = static_cast<bNodeSocket *>(from_node->inputs.first);
+    npr_bridge_collect_closure_sources(reroute_in, out);
+    return;
+  }
+  if (ELEM(from_node->type_legacy, SH_NODE_MIX_SHADER, SH_NODE_ADD_SHADER)) {
+    for (bNodeSocket &in_sock_ref : from_node->inputs) {
+      bNodeSocket *in_sock = &in_sock_ref;
+      if (in_sock->type == SOCK_SHADER) {
+        npr_bridge_collect_closure_sources(in_sock, out);
+      }
+    }
+    return;
+  }
+  /* Leaf closure node. */
+  out.add(from_node);
+}
+
+bool npr_bridge_shader_same_chain(bNodeTree *mat_tree, bNode *bridge_output)
+{
+  if (mat_tree == nullptr || bridge_output == nullptr) {
+    return false;
+  }
+  bNodeSocket *bridge_sock = bke::node_find_socket(*bridge_output, SOCK_IN, "Shader");
+  if (bridge_sock == nullptr || bridge_sock->link == nullptr) {
+    return false;
+  }
+  Set<bNode *> bridge_sources;
+  npr_bridge_collect_closure_sources(bridge_sock, bridge_sources);
+
+  bNode *mat_output = ntreeShaderOutputNode(mat_tree, SHD_OUTPUT_EEVEE);
+  if (mat_output == nullptr) {
+    return false;
+  }
+  bNodeSocket *surface_sock = bke::node_find_socket(*mat_output, SOCK_IN, "Surface");
+  if (surface_sock == nullptr || surface_sock->link == nullptr) {
+    return false;
+  }
+  Set<bNode *> main_sources;
+  npr_bridge_collect_closure_sources(surface_sock, main_sources);
+
+  for (bNode *n : bridge_sources) {
+    if (main_sources.contains(n)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 static bNode *ntreeShaderNPROutputNode(bNodeTree *localtree)
@@ -1147,6 +1208,17 @@ void ntreeGPUMaterialNodes(bNodeTree *localtree, GPUMaterial *mat)
 {
   bNodeTreeExec *exec;
   const bool is_filter_material = gpu_material_uses_filter_domain(mat);
+  {
+    int bridge_count = 0;
+    for (bNode &n : localtree->nodes) {
+      if (n.type_legacy == SH_NODE_NPR_BRIDGE_OUTPUT) {
+        bridge_count++;
+      }
+    }
+    printf("[NPR Bridge] ntreeGPUMaterialNodes called: is_filter=%d bridge_count=%d\n",
+           is_filter_material,
+           bridge_count);
+  }
 
   ntree_shader_unlink_script_nodes(localtree);
   bke::node_tree_runtime::materialize_shader_portals(*localtree);
@@ -1170,6 +1242,7 @@ void ntreeGPUMaterialNodes(bNodeTree *localtree, GPUMaterial *mat)
       ntreeExecGPUNodes(exec, mat, output);
     }
     ntree_exec_gpu_nodes_of_type(exec, mat, localtree, SH_NODE_OUTPUT_AOV);
+    ntree_exec_gpu_nodes_of_type(exec, mat, localtree, SH_NODE_NPR_BRIDGE_OUTPUT);
     ntree_exec_gpu_nodes_of_type(exec, mat, localtree, SH_NODE_OUTLINE_CONTROL);
     ntreeShaderEndExecTree(exec);
     return;
@@ -1188,6 +1261,7 @@ void ntreeGPUMaterialNodes(bNodeTree *localtree, GPUMaterial *mat)
     ntreeExecGPUNodes(exec, mat, output, &depth);
     ntree_exec_gpu_nodes_of_type(exec, mat, localtree, SH_NODE_OUTPUT_AOV, &depth);
   }
+  ntree_exec_gpu_nodes_of_type(exec, mat, localtree, SH_NODE_NPR_BRIDGE_OUTPUT);
   ntree_exec_gpu_nodes_of_type(exec, mat, localtree, SH_NODE_OUTLINE_CONTROL);
   ntreeShaderEndExecTree(exec);
 }

@@ -27,6 +27,13 @@
 
 #include "DEG_depsgraph_query.hh"
 
+#include "BLI_memarena.h"
+
+#include "DNA_material_types.h"
+#include "DNA_node_types.h"
+
+#include "BKE_npr.hh"
+
 #include "GPU_framebuffer.hh"
 #include "GPU_texture.hh"
 
@@ -94,7 +101,48 @@ void Film::init_aovs(const Set<std::string> &passes_used_by_viewport_compositor)
     }
   }
 
+  /* Collect NPR Bridge Output sockets as virtual AOVs. Stored in a memarena for stable pointers
+   * kept by the `aovs` vector; the existing two-pass logic below consumes them transparently,
+   * so bridge Color/Vector land in the color hash region and Float in the value hash region. */
+  MemArena *bridge_arena = BLI_memarena_new(256, __func__);
+  Main *bmain = DEG_get_bmain(inst_.depsgraph);
+  for (blender::Material &mat : bmain->materials) {
+    bNodeTree *mtree = mat.nodetree;
+    if (mtree == nullptr) {
+      continue;
+    }
+    for (bNode &node_ref : mtree->nodes) {
+      bNode *node = &node_ref;
+      if (node->type_legacy != SH_NODE_NPR_BRIDGE_OUTPUT) {
+        continue;
+      }
+      /* Register all three slot hashes unconditionally. The Output node only writes the sockets
+       * that are connected (its gpu_fn checks in[].link), and the Input reads whatever was
+       * written. This avoids bke::node_find_socket, whose topology-cache may not be ready at
+       * Film::init time, causing silent skip of the bridge injection. */
+      auto add_bridge = [&](int type, int aov_type) {
+        char name[128];
+        BKE_npr_bridge_socket_name(&mat, node, type, name, sizeof(name));
+        printf("[NPR Bridge] init_aovs register: mat=%s node=%s name=%s hash=%u type=%d\n",
+               mat.id.name + 2,
+               node->name,
+               name,
+               BLI_hash_string(name),
+               aov_type);
+        ViewLayerAOV *tmp = (ViewLayerAOV *)BLI_memarena_calloc(bridge_arena,
+                                                                sizeof(ViewLayerAOV));
+        BLI_strncpy(tmp->name, name, sizeof(tmp->name));
+        tmp->type = aov_type;
+        aovs.append(tmp);
+      };
+      add_bridge(0, AOV_TYPE_COLOR);  /* color */
+      add_bridge(2, AOV_TYPE_COLOR);  /* vector */
+      add_bridge(1, AOV_TYPE_VALUE);  /* float */
+    }
+  }
+
   if (aovs.size() > AOV_MAX) {
+    BLI_memarena_free(bridge_arena);
     inst_.info_append_i18n("Error: Too many AOVs");
     return;
   }
@@ -122,6 +170,8 @@ void Film::init_aovs(const Set<std::string> &passes_used_by_viewport_compositor)
   if (!aovs.is_empty()) {
     enabled_categories_ |= PASS_CATEGORY_AOV;
   }
+
+  BLI_memarena_free(bridge_arena);
 }
 
 float *Film::read_aov(ViewLayerAOV *aov)

@@ -3193,6 +3193,12 @@ struct NodeShaderOutputAOV {
   char name[/*MAX_NAME*/ 64] = "";
 };
 
+struct NodeShaderNPRBridge {
+  DNA_DEFINE_CXX_METHODS(NodeShaderNPRBridge)
+
+  char name[/*MAX_NAME*/ 64] = "";
+};
+
 struct NodeShaderPortal {
   DNA_DEFINE_CXX_METHODS(NodeShaderPortal)
 
