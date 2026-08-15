@@ -25,17 +25,17 @@ static constexpr int stable_shadow_sample_max = 32;
 static void node_declare(NodeDeclarationBuilder &b)
 {
   b.is_function_node();
-  b.add_input<decl::Vector>("World Position").hide_value();
-  b.add_input<decl::Vector>("Normal").hide_value();
-  b.add_input<decl::Float>("Exponent").default_value(16.0f).min(1.0f).max(512.0f);
+  b.add_input<decl::Vector>("World Position"_ustr).hide_value();
+  b.add_input<decl::Vector>("Normal"_ustr).hide_value();
+  b.add_input<decl::Float>("Exponent"_ustr).default_value(16.0f).min(1.0f).max(512.0f);
 
-  b.add_output<decl::Color>("Diffuse Shading");
-  b.add_output<decl::Float>("Shadow");
-  b.add_output<decl::Color>("Ambient Lighting");
-  b.add_output<decl::Float>("Half-Lambert Factor");
-  b.add_output<decl::Float>("Blinn-Phong Factor");
-  b.add_output<decl::Float>("Self Shadow");
-  b.add_output<decl::Float>("Cast Shadow");
+  b.add_output<decl::Color>("Diffuse Shading"_ustr);
+  b.add_output<decl::Float>("Shadow"_ustr);
+  b.add_output<decl::Color>("Ambient Lighting"_ustr);
+  b.add_output<decl::Float>("Half-Lambert Factor"_ustr);
+  b.add_output<decl::Float>("Blinn-Phong Factor"_ustr);
+  b.add_output<decl::Float>("Self Shadow"_ustr);
+  b.add_output<decl::Float>("Cast Shadow"_ustr);
 }
 
 static void node_shader_init_shader_info(bNodeTree * /*ntree*/, bNode *node)
@@ -82,6 +82,7 @@ static int node_shader_gpu_shader_info(GPUMaterial *mat,
   }
   if (node->custom1 == SHD_SHADER_INFO_SHADOW_SOFT_FILTERED) {
     GPU_material_flag_set(mat, GPU_MATFLAG_RAYCAST);
+    GPU_material_hiz_data_set(mat);
   }
   return GPU_stack_link(mat,
                         node,
@@ -101,7 +102,7 @@ void register_node_type_sh_shader_info()
 
   static bke::bNodeType ntype;
 
-  sh_node_type_base(&ntype, "ShaderNodeShaderInfo", SH_NODE_SHADER_INFO);
+  sh_node_type_base(&ntype, "ShaderNodeShaderInfo"_ustr, SH_NODE_SHADER_INFO);
   ntype.ui_name = "Shader Info";
   ntype.ui_description =
       "Expose Eevee direct light, shadow mask, ambient probe, half-lambert, and Blinn-Phong "
@@ -111,7 +112,7 @@ void register_node_type_sh_shader_info()
   ntype.initfunc = file_ns::node_shader_init_shader_info;
   ntype.draw_buttons = file_ns::node_shader_buts;
   ntype.declare = file_ns::node_declare;
-  ntype.add_ui_poll = object_eevee_shader_nodes_poll;
+  ntype.add_ui_poll = object_or_npr_eevee_shader_nodes_poll;
   bke::node_type_storage(
       ntype, "NodeShaderShaderInfo", node_free_standard_storage, node_copy_standard_storage);
   ntype.gpu_fn = file_ns::node_shader_gpu_shader_info;

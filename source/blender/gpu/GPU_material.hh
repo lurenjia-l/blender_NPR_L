@@ -32,6 +32,7 @@ struct GPUInput;
 struct GPUNodeLink;
 struct GPUNodeStack;
 struct GPUPass;
+struct Material;
 namespace gpu {
 class Texture;
 class UniformBuf;
@@ -59,6 +60,24 @@ enum GPUMaterialStatus {
   GPU_MAT_FAILED = 0,
   GPU_MAT_QUEUED,
   GPU_MAT_SUCCESS,
+};
+
+/** Data lanes requested from an evaluated object by a material node. */
+enum eGPUReferencedObjectDataFlag : uint32_t {
+  GPU_REFERENCED_OBJECT_DATA_NONE = 0,
+  GPU_REFERENCED_OBJECT_DATA_TRANSFORM = (1u << 0),
+  GPU_REFERENCED_OBJECT_DATA_COLOR = (1u << 1),
+  GPU_REFERENCED_OBJECT_DATA_VISIBILITY = (1u << 2),
+  GPU_REFERENCED_OBJECT_DATA_TYPE = (1u << 3),
+  GPU_REFERENCED_OBJECT_DATA_LIGHT = (1u << 4),
+};
+ENUM_OPERATORS(eGPUReferencedObjectDataFlag);
+
+/** Original object identity retained by a GPUMaterial until Draw Manager sync. */
+struct GPUReferencedObject {
+  Object *object = nullptr;
+  uint32_t session_uid = 0;
+  eGPUReferencedObjectDataFlag flags = GPU_REFERENCED_OBJECT_DATA_NONE;
 };
 
 /* GPU_MAT_OPTIMIZATION_SKIP for cases where we do not
@@ -121,6 +140,7 @@ enum eGPUCustomNodeDependencyFlag {
   GPU_CUSTOM_NODE_DEPENDENCY_NONE = 0,
   GPU_CUSTOM_NODE_DEPENDENCY_GLSL_GEOMETRY_HELPERS = (1 << 0),
   GPU_CUSTOM_NODE_DEPENDENCY_GLSL_LIGHTPROBE_HELPERS = (1 << 1),
+  GPU_CUSTOM_NODE_DEPENDENCY_GLSL_MATRIX_HELPERS = (1 << 2),
 };
 ENUM_OPERATORS(eGPUCustomNodeDependencyFlag);
 
@@ -128,6 +148,8 @@ inline constexpr const char *GPU_GLSL_FUNCTION_GEOMETRY_HELPER_FILENAME =
     "__glsl_function_geometry_helpers.glsl";
 inline constexpr const char *GPU_GLSL_FUNCTION_LIGHTPROBE_HELPER_FILENAME =
     "__glsl_function_lightprobe_helpers.glsl";
+inline constexpr const char *GPU_GLSL_FUNCTION_MATRIX_HELPER_FILENAME =
+    "__glsl_function_matrix_helpers.glsl";
 
 using GPUCodegenCallbackFn = void (*)(void *thunk,
                                       GPUMaterial *mat,
@@ -188,9 +210,10 @@ gpu::Shader *GPU_material_get_shader(GPUMaterial *material);
 const char *GPU_material_get_name(GPUMaterial *material);
 
 /**
- * Return can be null if it's a world material.
+ * Return can be null if the GPU material was not compiled from a Material ID.
  */
 Material *GPU_material_get_material(GPUMaterial *material);
+bool GPU_material_is_world(const GPUMaterial *material);
 /**
  * Return true if the material compilation has not yet begin or begin.
  */
@@ -202,6 +225,10 @@ GPUMaterialStatus GPU_material_status(GPUMaterial *mat);
 eGPUMaterialOptimizationStatus GPU_material_optimization_status(GPUMaterial *mat);
 
 uint64_t GPU_material_compilation_timestamp(GPUMaterial *mat);
+double GPU_material_compilation_time(GPUMaterial *mat);
+int GPU_material_recompile_serial_get(const GPUMaterial *mat);
+void GPU_material_recompile_serial_increment(Material *material);
+void GPU_material_recompile_serial_clear(const Material *material);
 
 gpu::UniformBuf *GPU_material_uniform_buffer_get(GPUMaterial *material);
 /**
@@ -219,10 +246,17 @@ bool GPU_material_has_filter_output(GPUMaterial *mat);
 bool GPU_material_has_light_shader_output(GPUMaterial *mat);
 bool GPU_material_has_glsl_light_shader_eval(const GPUMaterial *mat);
 bool GPU_material_has_shader_info_shadow_classification(const GPUMaterial *mat);
+bool GPU_material_uses_hiz_data(const GPUMaterial *mat);
 
 int GPU_material_filter_object_info_ensure(GPUMaterial *material, Object *object);
 int GPU_material_filter_object_info_count(const GPUMaterial *material);
 Object *GPU_material_filter_object_info_get(const GPUMaterial *material, int index);
+uint32_t GPU_material_referenced_object_ensure(
+    GPUMaterial *material, Object *object, eGPUReferencedObjectDataFlag flags);
+bool GPU_material_uses_referenced_object_data(const GPUMaterial *material);
+int GPU_material_referenced_object_count(const GPUMaterial *material);
+const GPUReferencedObject *GPU_material_referenced_object_get(const GPUMaterial *material,
+                                                              int index);
 int GPU_material_filter_mask_object_append(GPUMaterial *material, Object *object);
 int GPU_material_filter_mask_object_count(const GPUMaterial *material);
 Object *GPU_material_filter_mask_object_get(const GPUMaterial *material, int index);
@@ -286,6 +320,19 @@ enum GPUType {
 
   /* Opengl Attributes */
   GPU_ATTR = 3001,
+};
+
+/** Non-owning callback input description copied by the frame push API. */
+struct GPUMaterialClosureCallbackInput {
+  int closure_output_node_id = 0;
+  StringRef item_key;
+  GPUType type = GPU_NONE;
+  int function_input_index = -1;
+};
+
+struct GPUMaterialFunctionOutput {
+  GPUType type = GPU_NONE;
+  GPUNodeLink **link = nullptr;
 };
 
 enum GPUDefaultValue {
@@ -383,17 +430,32 @@ struct GPUNodeStack {
 
   bool socket_not_zero() const
   {
-    return this->link || (clamp_f(this->vec[0], 0.0f, 1.0f) > 1e-5f);
+    return this->link || (saturate_f(this->vec[0]) > near_zero);
   }
 
   bool socket_not_one() const
   {
-    return this->link || (clamp_f(this->vec[0], 0.0f, 1.0f) < 1.0f - 1e-5f);
+    return this->link || (saturate_f(this->vec[0]) < near_one);
   }
 
-  bool socket_is_one() const
+  bool socket_not_black() const
   {
-    return !this->link && (clamp_f(this->vec[0], 0.0f, 1.0f) > 0.9999f);
+    return this->link || saturate_f(this->vec[0]) > near_zero ||
+           saturate_f(this->vec[1]) > near_zero || saturate_f(this->vec[2]) > near_zero;
+  }
+
+  bool socket_not_white() const
+  {
+    return this->link || saturate_f(this->vec[0]) < near_one ||
+           saturate_f(this->vec[1]) < near_one || saturate_f(this->vec[2]) < near_one;
+  }
+
+ private:
+  static constexpr float near_zero = 1e-5f;
+  static constexpr float near_one = 1.0f - 1e-5f;
+  float saturate_f(const float f) const
+  {
+    return clamp_f(f, 0.0f, 1.0f);
   }
 };
 
@@ -422,6 +484,8 @@ struct GPUCodegenOutput {
   std::optional<GPUGraphOutput> depth_offset;
   GPUGraphOutput npr;
   GPUGraphOutput filter;
+  Vector<int> filter_output_identifiers;
+  Vector<GPUGraphOutput> filter_outputs;
   std::optional<GPUGraphOutput> light_shader;
   GPUGraphOutput composite;
   Vector<GPUGraphOutput> material_functions;
@@ -498,6 +562,19 @@ void GPU_material_closure_uv_gradient_source_pop(GPUMaterial *material);
 void GPU_material_closure_uv_gradient_source_get(const GPUMaterial *material,
                                                  StringRefNull &r_dx_source,
                                                  StringRefNull &r_dy_source);
+/** Pushes an owned copy. Lookup searches frames from the newest to the oldest. */
+void GPU_material_closure_callback_input_frame_push(GPUMaterial *material,
+                                                    Span<GPUMaterialClosureCallbackInput> inputs);
+void GPU_material_closure_callback_input_frame_pop(GPUMaterial *material);
+bool GPU_material_closure_callback_input_find(const GPUMaterial *material,
+                                              int closure_output_node_id,
+                                              StringRef item_key,
+                                              GPUType &r_type,
+                                              int &r_function_input_index,
+                                              bool &r_is_ancestor_capture);
+bool GPU_material_closure_callback_input_frame_error_set(GPUMaterial *material, StringRef error);
+bool GPU_material_closure_callback_input_frame_error_get(const GPUMaterial *material,
+                                                         std::string &r_error);
 
 bool GPU_link(GPUMaterial *mat, const char *name, ...);
 bool GPU_stack_link(GPUMaterial *mat,
@@ -531,9 +608,11 @@ void GPU_material_output_thickness(GPUMaterial *material, GPUNodeLink *link);
 void GPU_material_output_depth_offset(GPUMaterial *material, GPUNodeLink *link);
 void GPU_material_output_npr(GPUMaterial *material, GPUNodeLink *link);
 void GPU_material_output_filter(GPUMaterial *material, GPUNodeLink *link);
+void GPU_material_output_filter_item(GPUMaterial *material, int identifier, GPUNodeLink *link);
 void GPU_material_output_light_shader(GPUMaterial *material, GPUNodeLink *link);
 void GPU_material_glsl_light_shader_eval_set(GPUMaterial *material);
 void GPU_material_shader_info_shadow_classification_set(GPUMaterial *material);
+void GPU_material_hiz_data_set(GPUMaterial *material);
 
 void GPU_material_add_output_link_aov(GPUMaterial *material, GPUNodeLink *link, int hash);
 void GPU_material_add_output_link_outline(GPUMaterial *material, GPUNodeLink *link);
@@ -553,6 +632,15 @@ char *GPU_material_split_sub_function(GPUMaterial *material,
                                       GPUNodeLink **link,
                                       StringRefNull dependency_name);
 
+/**
+ * Wrap a part of the material graph into a void function with typed inputs and outputs.
+ * Each output is cast to its declared type and all output dependency graphs are serialized once.
+ */
+char *GPU_material_split_sub_function_multi(GPUMaterial *material,
+                                            Span<GPUType> input_types,
+                                            Span<GPUMaterialFunctionOutput> outputs,
+                                            StringRefNull dependency_name);
+
 void GPU_material_flag_set(GPUMaterial *mat, eGPUMaterialFlag flag);
 eGPUMaterialFlag GPU_material_flag(const GPUMaterial *mat);
 void GPU_material_set_time_dependent(GPUMaterial *mat);
@@ -561,5 +649,21 @@ bool GPU_material_is_time_dependent(const GPUMaterial *mat);
 GHash *GPU_uniform_attr_list_hash_new(const char *info);
 void GPU_uniform_attr_list_copy(GPUUniformAttrList *dest, const GPUUniformAttrList *src);
 void GPU_uniform_attr_list_free(GPUUniformAttrList *set);
+
+/* Returns the GPU node stack of the input with the given identifier in the given node within the
+ * given inputs stack array. */
+GPUNodeStack &GPU_node_get_input(const bNode &node, GPUNodeStack inputs[], StringRef identifier);
+
+/* Returns the GPU node stack of the output with the given identifier in the given node within the
+ * given output stack array. */
+GPUNodeStack &GPU_node_get_output(const bNode &node, GPUNodeStack outputs[], StringRef identifier);
+
+/* Returns the GPU node link of the input with the given identifier in the given node within the
+ * given inputs stack array, if the input is not linked, a uniform link carrying the value of the
+ * input will be created and returned. It is expected that the caller will use the returned link in
+ * a GPU material, otherwise, the link may not be properly freed. */
+GPUNodeLink *GPU_node_get_input_link(const bNode &node,
+                                     GPUNodeStack inputs[],
+                                     StringRef identifier);
 
 }  // namespace blender

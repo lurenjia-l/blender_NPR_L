@@ -13,10 +13,18 @@ motion tracking and video editing.
 
 ![Blender screenshot](https://code.blender.org/wp-content/uploads/2018/12/springrg.jpg "Blender screenshot")
 
+Blender NPR Port 5.2 LTS
+------------------------
+
+This branch adds NPR workflows to Blender 5.2 LTS. The NPR extensions target EEVEE; the release package also includes Cycles for standard Blender workflows.
+
+- [NPR Port Documentation](https://bb-yi.github.io/blender/)
+- [Latest Blender 5.2.0 NPR Port Release (Windows)](https://github.com/bb-yi/blender/releases/latest)
+
 Project Pages
 -------------
 
-- [Main Website](http://www.blender.org)
+- [Main Website](https://www.blender.org)
 - [Reference Manual](https://docs.blender.org/manual/en/latest/index.html)
 - [User Community](https://www.blender.org/community/)
 

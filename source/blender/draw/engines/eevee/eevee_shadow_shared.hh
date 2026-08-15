@@ -76,7 +76,7 @@ struct [[host_shared]] ShadowTileMapData {
   /** Effective minimum resolution after update throttle. */
   int effective_lod_min;
   float _pad2;
-  /** Near and far clip distances for punctual. */
+  /** Near and far clip distances for punctual (positive). */
   float clip_near;
   float clip_far;
   /** Half of the tilemap size in world units. Used to compute window matrix. */
@@ -199,36 +199,45 @@ enum [[host_shared]] eShadowFlag : uint32_t {
   SHADOW_IS_ALLOCATED = (1u << 28u),
   SHADOW_DO_UPDATE = (1u << 29u),
   SHADOW_IS_RENDERED = (1u << 30u),
-  SHADOW_IS_USED = (1u << 31u)
+  SHADOW_IS_USED = (1u << 31u),
+  /* Reuse the same flag for tagging update before LOD propagation.
+   * Assume usage tagging is done afterwards. */
+  SHADOW_TAG_UPDATE = (1u << 31u)
 };
 
 /* Page and cache indices share the same 15 bit payload in packed tile data. */
 #define SHADOW_PAGE_MASK 32767u
-#define SHADOW_PAGE_PER_LAYER_LOD 4u
-#define SHADOW_PAGE_LAYER_MASK 2047u
+#define SHADOW_PAGE_PER_LAYER_LOD 6u
+#define SHADOW_PAGE_LAYER_MASK 511u
 #define SHADOW_SAMPLING_TILE_LOD_MASK 7u
 #define SHADOW_SAMPLING_TILE_LOD_OFFSET_BITS 7u
 #define SHADOW_SAMPLING_TILE_LOD_OFFSET_MASK 127u
 
-/* NOTE: Trust the input to be in valid range (max is [3,3,2047]).
+/* NOTE: Trust the input to be in valid range (max is [7,7,511]).
  * If it is in valid range, it should pack to 15 bits so that `shadow_tile_pack()` can use it.
  * Sometimes this is used to encode invalid pages like uint3(-1). Callers that care about
  * invalid values must check the original packed value or tile flags, not the unpacked page.
  */
 static inline uint shadow_page_pack(uint3 page)
 {
-  BLI_STATIC_ASSERT(SHADOW_PAGE_PER_ROW <= 4 && SHADOW_PAGE_PER_COL <= 4, "Update page packing")
+  BLI_STATIC_ASSERT(SHADOW_PAGE_PER_ROW <= 8 && SHADOW_PAGE_PER_COL <= 8 &&
+                        SHADOW_PAGE_MAX_LAYER <= 512,
+                    "Update page packing")
   BLI_STATIC_ASSERT(SHADOW_MAX_PAGE <= 32768, "Update page packing")
-  return (page.x << 0u) | (page.y << 2u) | (page.z << SHADOW_PAGE_PER_LAYER_LOD);
+  return (page.x << 0u) | (page.y << 3u) | (page.z << 6u);
 }
 static inline uint3 shadow_page_unpack(uint data)
 {
   uint3 page;
-  BLI_STATIC_ASSERT(SHADOW_PAGE_PER_ROW <= 4 && SHADOW_PAGE_PER_COL <= 4, "Update page packing")
-  page.x = (data >> 0u) & 3u;
-  page.y = (data >> 2u) & 3u;
-  BLI_STATIC_ASSERT(SHADOW_MAX_PAGE <= 32768, "Update page packing")
+  /* clang-format off */ /* Multi-line macros break shader error lines. */
+  BLI_STATIC_ASSERT(SHADOW_PAGE_PER_ROW <= 8 && SHADOW_PAGE_PER_COL <= 8 && SHADOW_PAGE_MAX_LAYER <= 512, "Update page packing")
+  /* clang-format on */
+  page.x = (data >> 0u) & 7u;
+  page.y = (data >> 3u) & 7u;
   page.z = (data >> SHADOW_PAGE_PER_LAYER_LOD) & SHADOW_PAGE_LAYER_MASK;
+  /* clang-format off */ /* Multi-line macros break shader error lines. */
+  BLI_STATIC_ASSERT(SHADOW_MAX_PAGE == (SHADOW_PAGE_PER_ROW * SHADOW_PAGE_PER_COL * SHADOW_PAGE_MAX_LAYER), "Update page packing")
+  /* clang-format on */
   return page;
 }
 

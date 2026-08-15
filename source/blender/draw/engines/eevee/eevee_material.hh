@@ -112,7 +112,8 @@ static inline uint64_t shader_uuid_from_material_type(
     eMaterialProbe probe_capture = MAT_PROBE_NONE,
     char blend_flags = 0,
     bool use_outline = true,
-    bool depth_offset_affect_lighting = false)
+    bool depth_offset_affect_lighting = false,
+    uint64_t extra_key = 0)
 {
   BLI_assert(int64_t(displacement_type) < (1 << 1));
   BLI_assert(int64_t(thickness_type) < (1 << 1));
@@ -120,6 +121,7 @@ static inline uint64_t shader_uuid_from_material_type(
   BLI_assert(int64_t(geometry_type) < (1 << 4));
   BLI_assert(int64_t(pipeline_type) < (1 << 4));
   uint64_t transparent_shadows = blend_flags & MA_BL_TRANSPARENT_SHADOW ? 1 : 0;
+  uint64_t blend_flag_bits = uint64_t(static_cast<unsigned char>(blend_flags));
 
   uint64_t uuid;
   uuid = geometry_type;
@@ -130,6 +132,12 @@ static inline uint64_t shader_uuid_from_material_type(
   uuid |= transparent_shadows << 12;
   uuid |= uint64_t(use_outline) << 13;
   uuid |= uint64_t(depth_offset_affect_lighting) << 14;
+  /* Keep the full blend flag in the shader key. Beyond transparent shadows, flags such as
+   * raytraced transmission affect prepass replacement and auxiliary passes. */
+  uuid |= blend_flag_bits << 15;
+  /* Higher bits are intentionally ignored by material_type_from_shader_uuid(). They separate
+   * graph-dependent variants such as different NPR trees attached to the same material/world. */
+  uuid |= extra_key << 23;
   return uuid;
 }
 
@@ -293,6 +301,7 @@ struct MaterialKey {
     options = (options << 1) | (visibility_flags & OB_HIDE_SHADOW ? 0 : 1);
     options = (options << 1) | (visibility_flags & OB_HIDE_PROBE_CUBEMAP ? 0 : 1);
     options = (options << 1) | (visibility_flags & OB_HIDE_PROBE_PLANAR ? 0 : 1);
+    options = (options << 1) | (visibility_flags & OB_HIDE_RAYCAST ? 0 : 1);
     options = (options << 16) | uint16_t(refraction_layer);
     options = (options << 3) | uint64_t(material_ztest_mode_get(*mat_));
     options = (options << 1) | uint64_t(material_color_write_get(*mat_));
@@ -349,7 +358,8 @@ struct ShaderKey {
             blender::Material *blender_mat,
             eMaterialPipeline pipeline_type,
             eMaterialProbe probe_capture,
-            short refraction_layer)
+            short refraction_layer,
+            bool hide_from_raycast)
   {
     shader = GPU_material_get_shader(gpumat);
     options = uint64_t(shader_closure_bits_from_flag(gpumat));
@@ -367,6 +377,7 @@ struct ShaderKey {
               uint64_t(use_material_write_state ? material_depth_write_get(*blender_mat) : true);
     options = (options << 2) | uint64_t(probe_capture);
     options = (options << 16) | uint16_t(refraction_layer);
+    options = (options << 1) | (hide_from_raycast ? 1 : 0);
   }
 
   uint64_t hash() const
@@ -388,8 +399,8 @@ struct ShaderKey {
  * \{ */
 
 struct MaterialPass {
-  GPUMaterial *gpumat;
-  PassMain::Sub *sub_pass;
+  GPUMaterial *gpumat = nullptr;
+  PassMain::Sub *sub_pass = nullptr;
 };
 
 struct Material {
@@ -398,11 +409,19 @@ struct Material {
   bool has_surface;
   bool has_volume;
   bool uses_outline_control;
+  /* Snapshot while the pass GPUMaterial pointers are valid during material sync. */
+  bool telemetry_uses_npr;
+  bool telemetry_uses_raycast;
+  bool telemetry_uses_glsl_function;
   MaterialPass shadow;
   MaterialPass shading;
   MaterialPass npr;
   MaterialPass prepass;
   MaterialPass stencil;
+  /* These pipelines need a sub-pass per object/instance, so the returned sub_pass for these are
+   * always null and the sub-pass creation is handled directly by the SyncModule.
+   * Note that this also applies to the shading MaterialPass in the case of alpha-blended
+   * materials. */
   MaterialPass overlap_masking;
   MaterialPass outline_occlusion;
   MaterialPass capture;
@@ -434,6 +453,10 @@ class MaterialModule {
   int64_t queued_shaders_count = 0;
   int64_t queued_textures_count = 0;
   int64_t queued_optimize_shaders_count = 0;
+
+  bool material_time_changed = true;
+  float material_frame = 0;
+  float material_time = 0;
 
  private:
   Instance &inst_;
@@ -472,12 +495,18 @@ class MaterialModule {
   /**
    * Returned Material references are valid until the next call to this function or material_get().
    */
-  MaterialArray &material_array_get(Object *ob, bool has_motion);
+  MaterialArray &material_array_get(const ObjectHandle &ob_handle, bool has_motion);
   /**
    * Returned Material references are valid until the next call to this function or
    * material_array_get().
    */
-  Material &material_get(Object *ob, bool has_motion, int mat_nr, eMaterialGeometry geometry_type);
+  Material material_get(const ObjectHandle &ob_handle,
+                        bool has_motion,
+                        int mat_nr,
+                        eMaterialGeometry geometry_type);
+
+  /* Push unloaded textures used by this material to the texture loading queue. */
+  void queue_texture_loading(GPUMaterial *material);
 
   /* Request default materials and return DEFAULT_MATERIALS if they are compiled. */
   ShaderGroups default_materials_load_async()
@@ -490,7 +519,7 @@ class MaterialModule {
   }
 
  private:
-  Material &material_sync(Object *ob,
+  Material &material_sync(const ObjectHandle &ob_handle,
                           blender::Material *blender_mat,
                           eMaterialGeometry geometry_type,
                           bool has_motion);
@@ -503,9 +532,6 @@ class MaterialModule {
                                  eMaterialGeometry geometry_type,
                                  eMaterialProbe probe_capture = MAT_PROBE_NONE,
                                  bool register_pass = true);
-
-  /* Push unloaded texture used by this material to the texture loading queue. */
-  void queue_texture_loading(GPUMaterial *material);
 
   ShaderGroups default_materials_load(bool block_until_ready = false);
 };

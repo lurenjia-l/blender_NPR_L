@@ -12,11 +12,27 @@
 
 namespace blender::nodes {
 
+class BaseSocketDeclarationBuilder;
+class DeclarationListBuilder;
+
 inline bool socket_type_supported_in_closure(const eNodeSocketDatatype socket_type,
                                              const int ntree_type)
 {
   return bke::node_tree_type_supports_socket_type_static(ntree_type, socket_type);
 }
+
+namespace node_geo_closure_cc {
+
+BaseSocketDeclarationBuilder &add_closure_socket_declaration(
+    DeclarationListBuilder &builder,
+    eNodeSocketDatatype socket_type,
+    eNodeSocketInOut in_out,
+    UString name,
+    UString identifier,
+    const bNodeSocket *socket,
+    StringRef key);
+
+}  // namespace node_geo_closure_cc
 
 struct ClosureInputItemsAccessor : public socket_items::SocketItemsAccessorDefaults {
   using ItemT = NodeClosureInputItem;
@@ -62,7 +78,7 @@ struct ClosureInputItemsAccessor : public socket_items::SocketItemsAccessorDefau
 
   static eNodeSocketDatatype get_socket_type(const ItemT &item)
   {
-    return eNodeSocketDatatype(item.socket_type);
+    return item.socket_type;
   }
 
   static char **get_name(ItemT &item)
@@ -136,7 +152,7 @@ struct ClosureOutputItemsAccessor : public socket_items::SocketItemsAccessorDefa
 
   static eNodeSocketDatatype get_socket_type(const ItemT &item)
   {
-    return eNodeSocketDatatype(item.socket_type);
+    return item.socket_type;
   }
 
   static char **get_name(ItemT &item)
@@ -210,7 +226,7 @@ struct EvaluateClosureInputItemsAccessor : public socket_items::SocketItemsAcces
 
   static eNodeSocketDatatype get_socket_type(const ItemT &item)
   {
-    return eNodeSocketDatatype(item.socket_type);
+    return item.socket_type;
   }
 
   static char **get_name(ItemT &item)
@@ -285,7 +301,7 @@ struct EvaluateClosureOutputItemsAccessor : public socket_items::SocketItemsAcce
 
   static eNodeSocketDatatype get_socket_type(const ItemT &item)
   {
-    return eNodeSocketDatatype(item.socket_type);
+    return item.socket_type;
   }
 
   static char **get_name(ItemT &item)

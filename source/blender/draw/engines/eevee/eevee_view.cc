@@ -113,7 +113,7 @@ namespace blender::eevee
 
     main_view_.sync(viewmat, winmat);
 
-    inst_.uniform_data.data.pipeline.is_main_view_inverted = main_view_.is_inverted();
+    inst_.uniform_data.pipeline.is_main_view_inverted = main_view_.is_inverted();
   }
 
   void ShadingView::render()
@@ -129,6 +129,15 @@ namespace blender::eevee
       ScopedTelemetrySample telemetry_sample(inst_.telemetry, TelemetryStageId::MainUpdateView);
       update_view();
     }
+
+    inst_.shadows.set_view(render_view_, extent_);
+    inst_.volume.set_view(main_view_);
+    inst_.uniform_data.data.push_update();
+    bool volume_compute_done = false;
+    /* Need to be set early for planar probe rendering (if using ray-cast node) and ray-cast nodes
+     * in deferred / forward pipelines. */
+    inst_.raytracing.thickness_parameters_setup(render_view_.winmat(), extent_);
+    inst_.uniform_data.raytrace.push_update();
 
     GPU_debug_group_begin(name_);
 
@@ -191,7 +200,7 @@ namespace blender::eevee
     }
 
     /* Alpha stores transmittance. So start at 1. */
-    float4 clear_color = { 0.0f, 0.0f, 0.0f, 1.0f };
+    double4 clear_color = {0.0, 0.0, 0.0, 1.0};
     GPU_framebuffer_bind(combined_fb_);
     GPU_framebuffer_clear_color_depth(combined_fb_, clear_color, inst_.film.depth.clear_value);
     inst_.pipelines.background.clear(render_view_);
@@ -221,16 +230,23 @@ namespace blender::eevee
     {
       ScopedTelemetrySample telemetry_sample(inst_.telemetry, TelemetryStageId::MainDeferred);
       inst_.pipelines.deferred.render(main_view_,
-        render_view_,
-        prepass_fb_,
-        combined_fb_,
-        gbuffer_fb_,
-        extent_,
-        rt_buffer_opaque_,
-        rt_buffer_refract_);
+                                      render_view_,
+                                      prepass_fb_,
+                                      combined_fb_,
+                                      gbuffer_fb_,
+                                      extent_,
+                                      rt_buffer_opaque_,
+                                      rt_buffer_refract_,
+                                      volume_compute_done);
     }
 
-    inst_.gbuffer.release();
+    /* NPR: the outline detect pass reads the deferred GBuffer (surface normals for raytrace
+     * transmission, see d55d73358c0b). Keep the GBuffer alive until after the outline pass when
+     * outline is enabled; otherwise release it right away to free the pool textures early. */
+    const bool defer_gbuffer_release_for_outline = inst_.outline.enabled();
+    if (!defer_gbuffer_release_for_outline) {
+      inst_.gbuffer.release();
+    }
 
     if (inst_.filter_materials.has_stage_entries(SCE_EEVEE_FILTER_STAGE_BEFORE_VOLUME_FOG))
     {
@@ -248,7 +264,9 @@ namespace blender::eevee
 
     {
       ScopedTelemetrySample telemetry_sample(inst_.telemetry, TelemetryStageId::MainVolumeCompute);
-      inst_.volume.draw_compute(main_view_, extent_);
+      if (!volume_compute_done) {
+        inst_.volume.draw_compute(main_view_, extent_);
+      }
     }
 
     {
@@ -272,6 +290,11 @@ namespace blender::eevee
       inst_.outline.render(render_view_, extent_);
     }
 
+    /* NPR: release the GBuffer that was kept alive for the outline detect pass (see above). */
+    if (defer_gbuffer_release_for_outline) {
+      inst_.gbuffer.release();
+    }
+
     gpu::Texture *outline_raw_tx = inst_.outline.resolved_texture();
     gpu::Texture *outline_combined_tx = nullptr;
     if (inst_.outline.use_in_combined()) {
@@ -286,6 +309,7 @@ namespace blender::eevee
     }
     inst_.native_postfx_outputs.render(render_view_);
 
+    inst_.lights.shape_display_draw(render_view_, combined_fb_);
     inst_.lights.debug_draw(render_view_, combined_fb_);
     inst_.hiz_buffer.debug_draw(render_view_, combined_fb_);
     inst_.shadows.debug_draw(render_view_, combined_fb_);
@@ -341,7 +365,7 @@ namespace blender::eevee
     }
     if (uses_postfx_passes)
     {
-      postfx_tx.acquire(extent_, gpu::TextureFormat::SFLOAT_16_16_16_16);
+      postfx_tx.acquire_2d(extent_, gpu::TextureFormat::SFLOAT_16_16_16_16);
     }
 
     /* Fix a sync bug on AMD + Mesa when volume + motion blur create artifacts
@@ -489,7 +513,7 @@ namespace blender::eevee
         {
           if (assign_if_different(inst_.pipelines.data.ray_type, ray_type))
           {
-            inst_.uniform_data.push_update();
+            inst_.uniform_data.pipeline.push_update();
           }
 
           for (int face : IndexRange(6))
@@ -507,7 +531,7 @@ namespace blender::eevee
               GPU_ATTACHMENT_NONE,
               GPU_ATTACHMENT_TEXTURE_CUBEFACE(inst_.sphere_probes.cubemap_tx_, face));
             GPU_framebuffer_bind(combined_fb_);
-            GPU_framebuffer_clear_color(combined_fb_, float4(0.0f));
+            GPU_framebuffer_clear_color(combined_fb_, double4(0.0));
             inst_.pipelines.world.render(view);
           }
         };
@@ -531,11 +555,20 @@ namespace blender::eevee
 
       /* All volume probe that needs to composite the world probe need to be updated. */
       inst_.volume_probes.update_world_irradiance();
+      inst_.light_probes.probe_cost_accumulate("World Sphere Probe",
+                                               "SPHERE_WORLD",
+                                               1,
+                                               1,
+                                               6,
+                                               update_info->cube_target_extent,
+                                               (6.0 * double(update_info->cube_target_extent) *
+                                                double(update_info->cube_target_extent)) /
+                                                   1000000.0);
     }
 
     if (assign_if_different(inst_.pipelines.data.ray_type, RAY_TYPE_CAMERA))
     {
-      inst_.uniform_data.push_update();
+      inst_.uniform_data.pipeline.push_update();
     }
 
     GPU_debug_group_end();
@@ -546,14 +579,31 @@ namespace blender::eevee
     ScopedTelemetrySample telemetry_sample(inst_.telemetry, TelemetryStageId::CaptureProbes);
     Framebuffer prepass_fb;
     View view = { "Capture.View" };
+    int updated_probe_count = 0;
+    int rendered_view_count = 0;
+    int max_resolution = 0;
+    double estimated_work = 0.0;
+    int prev_extent = 0;
     while (const auto update_info = inst_.sphere_probes.probe_update_info_pop())
     {
       GPU_debug_group_begin("Probe.Capture");
+      updated_probe_count++;
+      rendered_view_count += 6;
+      max_resolution = max_ii(max_resolution, update_info->cube_target_extent);
+      estimated_work += (6.0 * double(update_info->cube_target_extent) *
+                         double(update_info->cube_target_extent)) /
+                        1000000.0;
 
-      if (assign_if_different(inst_.pipelines.data.ray_type, RAY_TYPE_GLOSSY))
+      if (assign_if_different(inst_.pipelines.data.ray_type, RAY_TYPE_GLOSSY) ||
+          prev_extent != update_info->cube_target_extent)
       {
-        inst_.uniform_data.push_update();
+        /* Set correct thickness for raycast node in probe pipelines. */
+        float4x4 win_m4 = math::projection::perspective(-0.1f, 0.1f, -0.1f, 0.1f, 0.1f, 10.0f);
+        inst_.raytracing.thickness_parameters_setup(win_m4, int2(update_info->cube_target_extent));
+        inst_.uniform_data.pipeline.push_update();
+        inst_.uniform_data.raytrace.push_update();
       }
+      prev_extent = update_info->cube_target_extent;
 
       int2 extent = int2(update_info->cube_target_extent);
       RenderBuffers& rbufs = inst_.render_buffers;
@@ -565,7 +615,7 @@ namespace blender::eevee
         GPU_ATTACHMENT_TEXTURE(rbufs.depth_tx),
         with_prepass_normal ? GPU_ATTACHMENT_TEXTURE(rbufs.prepass_normal_tx) : GPU_ATTACHMENT_NONE,
         with_raycast ? GPU_ATTACHMENT_TEXTURE(rbufs.object_id_tx) : GPU_ATTACHMENT_NONE,
-        GPU_ATTACHMENT_TEXTURE(rbufs.vector_tx));
+        GPU_ATTACHMENT_NONE /* Motion vectors not supported. */);
 
       rbufs.vector_tx.clear(float4(0.0f));
       if (with_raycast)
@@ -594,6 +644,10 @@ namespace blender::eevee
           update_info->clipping_distances.y);
         view.sync(view_m4, win_m4);
 
+        inst_.shadows.set_view(view, extent);
+        inst_.volume.set_view(view);
+        inst_.uniform_data.data.push_update();
+
         combined_fb_.ensure(GPU_ATTACHMENT_TEXTURE(inst_.render_buffers.depth_tx),
           GPU_ATTACHMENT_TEXTURE_CUBEFACE(inst_.sphere_probes.cubemap_tx_, face));
 
@@ -606,7 +660,7 @@ namespace blender::eevee
 
         GPU_framebuffer_bind(combined_fb_);
         GPU_framebuffer_clear_color_depth(
-          combined_fb_, float4(0.0f, 0.0f, 0.0f, 1.0f), inst_.film.depth.clear_value);
+          combined_fb_, double4(0.0, 0.0, 0.0, 1.0), inst_.film.depth.clear_value);
         inst_.pipelines.probe.render(view,
           prepass_fb,
           combined_fb_,
@@ -621,9 +675,17 @@ namespace blender::eevee
       inst_.sphere_probes.remap_to_octahedral_projection(update_info->atlas_coord, true, false);
     }
 
+    inst_.light_probes.probe_cost_accumulate("Sphere Probes",
+                                             "SPHERE",
+                                             updated_probe_count,
+                                             inst_.light_probes.sphere_probe_count(),
+                                             rendered_view_count,
+                                             max_resolution,
+                                             estimated_work);
+
     if (assign_if_different(inst_.pipelines.data.ray_type, RAY_TYPE_CAMERA))
     {
-      inst_.uniform_data.push_update();
+      inst_.uniform_data.pipeline.push_update();
     }
   }
 

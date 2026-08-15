@@ -19,6 +19,7 @@
 
 #include "BKE_screen.hh"
 
+#include "NOD_node_declaration.hh"
 #include "NOD_socket_items.hh"
 
 namespace blender::nodes::socket_items::ui {
@@ -68,31 +69,35 @@ static void draw_items_list_with_operators(const bContext *C,
   }();
 
   blender::ui::Layout *row = &layout->row(false);
-  template_list(row,
-                C,
-                items_list->idname,
-                "",
-                &node_ptr,
-                Accessor::rna_names::items,
-                &node_ptr,
-                Accessor::rna_names::active_index.c_str(),
-                nullptr,
-                3,
-                5,
-                UILST_LAYOUT_DEFAULT,
-                blender::ui::TEMPLATE_LIST_FLAG_NONE);
+  template_uilist(row,
+                  C,
+                  items_list->idname,
+                  "",
+                  &node_ptr,
+                  Accessor::rna_names::items,
+                  &node_ptr,
+                  Accessor::rna_names::active_index.c_str(),
+                  nullptr,
+                  3,
+                  5,
+                  UILST_LAYOUT_DEFAULT,
+                  blender::ui::TEMPLATE_LIST_FLAG_NONE);
 
   blender::ui::Layout *ops_col = &row->column(false);
   {
     blender::ui::Layout *add_remove_col = &ops_col->column(true);
-    add_remove_col->op(Accessor::operator_idnames::add_item, "", ICON_ADD);
-    add_remove_col->op(Accessor::operator_idnames::remove_item, "", ICON_REMOVE);
+    PointerRNA op_ptr = add_remove_col->op(Accessor::operator_idnames::add_item, "", ICON_ADD);
+    RNA_int_set(&op_ptr, "node_identifier", node.identifier);
+    op_ptr = add_remove_col->op(Accessor::operator_idnames::remove_item, "", ICON_REMOVE);
+    RNA_int_set(&op_ptr, "node_identifier", node.identifier);
   }
   {
     blender::ui::Layout *up_down_col = &ops_col->column(true);
     PointerRNA op_ptr = up_down_col->op(Accessor::operator_idnames::move_item, "", ICON_TRIA_UP);
+    RNA_int_set(&op_ptr, "node_identifier", node.identifier);
     RNA_enum_set(&op_ptr, "direction", 0);
     op_ptr = up_down_col->op(Accessor::operator_idnames::move_item, "", ICON_TRIA_DOWN);
+    RNA_int_set(&op_ptr, "node_identifier", node.identifier);
     RNA_enum_set(&op_ptr, "direction", 1);
   }
 }
@@ -118,6 +123,18 @@ static void draw_active_item_props(const bNodeTree &tree,
   PointerRNA item_ptr = RNA_pointer_create_discrete(
       const_cast<ID *>(&tree.id), *Accessor::item_srna, &item);
   draw_item(&item_ptr);
+}
+
+template<typename Accessor> static auto draw_extend_socket_fn()
+{
+  return [](CustomSocketDrawParams &params) {
+    ::blender::ui::Layout &layout = params.layout;
+    layout.emboss_set(::blender::ui::EmbossType::None);
+    PointerRNA op_ptr = layout.op(Accessor::operator_idnames::add_item, "", ICON_ADD);
+    RNA_int_set(&op_ptr, "node_identifier", params.node.identifier);
+    RNA_boolean_set(&op_ptr, "show_dialog", true);
+    RNA_boolean_set(&op_ptr, "init_from_active", false);
+  };
 }
 
 }  // namespace blender::nodes::socket_items::ui

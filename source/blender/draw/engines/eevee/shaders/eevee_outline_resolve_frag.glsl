@@ -15,7 +15,7 @@ float4 outline_source_color_fetch(int2 texel)
   return texelFetch(outline_color_tx, texel, 0);
 }
 
-float4 outline_source_info_fetch(int2 texel)
+uint4 outline_source_info_fetch(int2 texel)
 {
   return texelFetch(outline_info_tx, texel, 0);
 }
@@ -57,23 +57,36 @@ void main()
     const float offset_length = length(offset) - 0.5f;
 
     const float4 seed = texelFetch(outline_seed_tx, seed_texel, 0);
+    /* .a = full line width (uniform across all seeds -> JFA coverage has no holes).
+     * .r = per-seed width modulation factor in (0, 1], already smoothed along the contour by the
+     * factor-blur pass (eevee_outline_factor_blur), so the drawn radius varies smoothly along the
+     * stroke without the per-Voronoi-cell sawtooth. The JFA partition is built on the uniform full
+     * width, so coverage is hole-free regardless of the factor. */
     const float seed_width = seed.a;
-    if (seed_width > 0.0f && offset_length <= seed_width * 0.5f) {
+    const float width_factor = clamp(seed.r, 0.0f, 1.0f);
+    const float effective_width = seed_width * width_factor;
+    if (effective_width > 0.0f && offset_length <= effective_width * 0.5f) {
       const float4 outline_color = outline_source_color_fetch(seed_texel);
       float alpha = outline_color.a;
-      if (offset_length <= 0.0f && seed_width <= 1.0f) {
-        alpha *= seed_width;
+      if (offset_length <= 0.0f && effective_width <= 1.0f) {
+        alpha *= effective_width;
       }
       else {
-        alpha *= clamp(seed_width * 0.5f - offset_length, 0.0f, 1.0f);
+        alpha *= clamp(effective_width * 0.5f - offset_length, 0.0f, 1.0f);
       }
 
       const float sample_depth = outline_depth_fetch(seed_texel);
+      const float sample_occlusion_depth = outline_occlusion_depth_fetch(seed_texel);
       const uint sample_outline_id = outline_id_unpack(outline_source_info_fetch(seed_texel).a);
-      const bool blocked_by_scene_surface = sample_outline_id != center_outline_id &&
-                                            center_depth < sample_depth;
-      const bool blocked_by_forward_occluder = center_occlusion_depth + 1e-5f <
-                                               min(center_depth, sample_depth);
+      const bool different_outline_id = sample_outline_id != center_outline_id;
+      const bool blocked_by_scene_surface = different_outline_id && center_depth < sample_depth;
+      const bool center_in_occluder_mask = center_occlusion_depth < 1.0f - 1e-5f;
+      const bool sample_in_occluder_mask = sample_occlusion_depth < 1.0f - 1e-5f;
+      const bool blocked_by_forward_occluder = use_outline_occlusion_depth != 0 &&
+                                               ((different_outline_id && sample_in_occluder_mask) ||
+                                                (!different_outline_id &&
+                                                 (center_in_occluder_mask ||
+                                                  sample_in_occluder_mask)));
 
       if (alpha > 0.0f && !(blocked_by_scene_surface || blocked_by_forward_occluder)) {
         outline_pass_color = float4(outline_color.rgb * alpha, alpha);

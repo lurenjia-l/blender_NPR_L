@@ -36,6 +36,7 @@
 #include "BLI_math_vector.h"
 #include "BLI_string.h"
 #include "BLI_sys_types.h"
+#include "BLI_vector.hh"
 
 #include "BKE_asset.hh"
 #include "BKE_attribute_legacy_convert.hh"
@@ -49,6 +50,9 @@
 #include "BKE_node_legacy_types.hh"
 #include "BKE_node_runtime.hh"
 #include "BKE_tracking.hh"
+
+#include "NOD_filter_graph.hh"
+#include "NOD_socket.hh"
 
 #include "SEQ_iterator.hh"
 #include "SEQ_sequencer.hh"
@@ -80,8 +84,8 @@ static void do_version_mix_node_mix_mode_compositor(bNodeTree &node_tree, bNode 
     return;
   }
 
-  bNodeSocket *first_input = bke::node_find_socket(node, SOCK_IN, "A_Color");
-  bNodeSocket *output = bke::node_find_socket(node, SOCK_OUT, "Result_Color");
+  bNodeSocket *first_input = bke::node_find_socket(node, SOCK_IN, "A_Color"_ustr);
+  bNodeSocket *output = bke::node_find_socket(node, SOCK_OUT, "Result_Color"_ustr);
 
   /* Find the link going into the inputs of the node. */
   bNodeLink *first_link = nullptr;
@@ -92,6 +96,8 @@ static void do_version_mix_node_mix_mode_compositor(bNodeTree &node_tree, bNode 
   }
 
   bNode &separate_node = version_node_add_empty(node_tree, "CompositorNodeSeparateColor");
+  /* Preserve the muted state on the new node so restoring all nodes later behaves the same way. */
+  SET_FLAG_FROM_TEST(separate_node.flag, node.flag & NODE_MUTED, NODE_MUTED);
   separate_node.parent = node.parent;
   separate_node.location[0] = node.location[0] - 10.0f;
   separate_node.location[1] = node.location[1];
@@ -112,6 +118,7 @@ static void do_version_mix_node_mix_mode_compositor(bNodeTree &node_tree, bNode 
   }
 
   bNode &set_alpha_node = version_node_add_empty(node_tree, "CompositorNodeSetAlpha");
+  SET_FLAG_FROM_TEST(set_alpha_node.flag, node.flag & NODE_MUTED, NODE_MUTED);
   set_alpha_node.parent = node.parent;
   set_alpha_node.location[0] = node.location[0] - 10.0f;
   set_alpha_node.location[1] = node.location[1];
@@ -158,8 +165,8 @@ static void do_version_mix_node_mix_mode_geometry(bNodeTree &node_tree, bNode &n
     return;
   }
 
-  bNodeSocket *first_input = bke::node_find_socket(node, SOCK_IN, "A_Color");
-  bNodeSocket *output = bke::node_find_socket(node, SOCK_OUT, "Result_Color");
+  bNodeSocket *first_input = bke::node_find_socket(node, SOCK_IN, "A_Color"_ustr);
+  bNodeSocket *output = bke::node_find_socket(node, SOCK_OUT, "Result_Color"_ustr);
 
   /* Find the link going into the inputs of the node. */
   bNodeLink *first_link = nullptr;
@@ -339,8 +346,8 @@ static void version_clear_unused_strip_flags(Main &bmain)
         constexpr int flag_delete = 1 << 10;
         constexpr int flag_ignore_channel_lock = 1 << 16;
         constexpr int flag_show_offsets = 1 << 20;
-        strip->flag &= ~(flag_overlap | flag_ipo_frame_locked | flag_effect_not_loaded |
-                         flag_delete | flag_ignore_channel_lock | flag_show_offsets);
+        strip->flag &= ~eStripFlag(flag_overlap | flag_ipo_frame_locked | flag_effect_not_loaded |
+                                   flag_delete | flag_ignore_channel_lock | flag_show_offsets);
         return true;
       });
     }
@@ -353,27 +360,27 @@ static void version_string_to_curves_node_inputs(bNodeTree &tree, bNode &node)
     return;
   }
   auto &storage = *reinterpret_cast<NodeGeometryStringToCurves *>(node.storage);
-  if (!blender::bke::node_find_socket(node, SOCK_IN, "Font")) {
+  if (!blender::bke::node_find_socket(node, SOCK_IN, "Font"_ustr)) {
     bNodeSocket &socket = version_node_add_socket(tree, node, SOCK_IN, "NodeSocketFont", "Font");
     socket.default_value_typed<bNodeSocketValueFont>()->value = reinterpret_cast<VFont *>(node.id);
     node.id = nullptr;
   }
-  if (!blender::bke::node_find_socket(node, SOCK_IN, "Overflow")) {
+  if (!blender::bke::node_find_socket(node, SOCK_IN, "Overflow"_ustr)) {
     bNodeSocket &socket = version_node_add_socket(
         tree, node, SOCK_IN, "NodeSocketMenu", "Overflow");
     socket.default_value_typed<bNodeSocketValueMenu>()->value = storage.overflow;
   }
-  if (!blender::bke::node_find_socket(node, SOCK_IN, "Align X")) {
+  if (!blender::bke::node_find_socket(node, SOCK_IN, "Align X"_ustr)) {
     bNodeSocket &socket = version_node_add_socket(
         tree, node, SOCK_IN, "NodeSocketMenu", "Align X");
     socket.default_value_typed<bNodeSocketValueMenu>()->value = storage.align_x;
   }
-  if (!blender::bke::node_find_socket(node, SOCK_IN, "Align Y")) {
+  if (!blender::bke::node_find_socket(node, SOCK_IN, "Align Y"_ustr)) {
     bNodeSocket &socket = version_node_add_socket(
         tree, node, SOCK_IN, "NodeSocketMenu", "Align Y");
     socket.default_value_typed<bNodeSocketValueMenu>()->value = storage.align_y;
   }
-  if (!blender::bke::node_find_socket(node, SOCK_IN, "Pivot Point")) {
+  if (!blender::bke::node_find_socket(node, SOCK_IN, "Pivot Point"_ustr)) {
     bNodeSocket &socket = version_node_add_socket(
         tree, node, SOCK_IN, "NodeSocketMenu", "Pivot Point");
     socket.default_value_typed<bNodeSocketValueMenu>()->value = storage.pivot_mode;
@@ -678,7 +685,7 @@ static void version_add_outline_control_id_edge_input(Main *bmain)
         continue;
       }
 
-      if (bNodeSocket *outline_id_input = bke::node_find_socket(node, SOCK_IN, "Outline ID")) {
+      if (bNodeSocket *outline_id_input = bke::node_find_socket(node, SOCK_IN, "Outline ID"_ustr)) {
         if (outline_id_input->type == SOCK_INT && outline_id_input->default_value != nullptr) {
           bNodeSocketValueInt *value = outline_id_input->default_value_typed<bNodeSocketValueInt>();
           value->value = std::min(value->value, 32767);
@@ -686,7 +693,7 @@ static void version_add_outline_control_id_edge_input(Main *bmain)
         }
       }
 
-      if (bke::node_find_socket(node, SOCK_IN, "ID Edge") != nullptr) {
+      if (bke::node_find_socket(node, SOCK_IN, "ID Edge"_ustr) != nullptr) {
         continue;
       }
 
@@ -711,7 +718,7 @@ static void version_add_outline_control_freestyle_edge_input(Main *bmain)
         continue;
       }
 
-      if (bke::node_find_socket(node, SOCK_IN, "Freestyle Edge") != nullptr) {
+      if (bke::node_find_socket(node, SOCK_IN, "Freestyle Edge"_ustr) != nullptr) {
         continue;
       }
 
@@ -721,6 +728,116 @@ static void version_add_outline_control_freestyle_edge_input(Main *bmain)
     }
   }
   FOREACH_NODETREE_END;
+}
+
+static bNodeSocket &version_ensure_outline_control_float_input(bNodeTree &ntree,
+                                                               bNode &node,
+                                                               const UString identifier,
+                                                               const float value,
+                                                               const float min,
+                                                               const float max)
+{
+  if (bNodeSocket *input = bke::node_find_socket(node, SOCK_IN, identifier)) {
+    return *input;
+  }
+
+  bNodeSocket &input = version_node_add_socket(
+      ntree, node, SOCK_IN, "NodeSocketFloat", identifier.c_str());
+  bNodeSocketValueFloat *default_value = input.default_value_typed<bNodeSocketValueFloat>();
+  default_value->value = value;
+  default_value->min = min;
+  default_value->max = max;
+  return input;
+}
+
+static void version_add_outline_control_width_variation_input(Main *bmain)
+{
+  FOREACH_NODETREE_BEGIN (bmain, ntree, id) {
+    if (ntree->type != NTREE_SHADER) {
+      continue;
+    }
+    for (bNode &node : ntree->nodes) {
+      if (node.type_legacy != SH_NODE_OUTLINE_CONTROL &&
+          !STREQ(node.idname, "ShaderNodeOutlineControl"))
+      {
+        continue;
+      }
+
+      version_ensure_outline_control_float_input(
+          *ntree, node, "Width Variation"_ustr, 0.0f, 0.0f, 1.0f);
+    }
+  }
+  FOREACH_NODETREE_END;
+}
+
+static void version_replace_outline_control_width_variation(Main *bmain)
+{
+  FOREACH_NODETREE_BEGIN (bmain, ntree, id) {
+    if (ntree->type != NTREE_SHADER) {
+      continue;
+    }
+    for (bNode &node : ntree->nodes) {
+      if (node.type_legacy != SH_NODE_OUTLINE_CONTROL &&
+          !STREQ(node.idname, "ShaderNodeOutlineControl"))
+      {
+        continue;
+      }
+
+      if (bNodeSocket *width_variation_input = bke::node_find_socket(
+              node, SOCK_IN, "Width Variation"_ustr))
+      {
+        bke::node_remove_socket(*ntree, node, *width_variation_input);
+      }
+
+      version_ensure_outline_control_float_input(
+          *ntree, node, "Depth Threshold Range"_ustr, 0.0f, 0.0f, 1.0f);
+      version_ensure_outline_control_float_input(
+          *ntree, node, "Depth Edge Width"_ustr, 1.0f, 0.0f, 1.0f);
+      version_ensure_outline_control_float_input(
+          *ntree, node, "Normal Threshold Range"_ustr, 0.0f, 0.0f, 1.0f);
+      version_ensure_outline_control_float_input(
+          *ntree, node, "Normal Edge Width"_ustr, 1.0f, 0.0f, 1.0f);
+      version_ensure_outline_control_float_input(
+          *ntree, node, "ID Edge Width"_ustr, 1.0f, 0.0f, 1.0f);
+    }
+  }
+  FOREACH_NODETREE_END;
+}
+
+static void version_scene_legacy_filter_materials_to_filter_graph(Main &bmain, Scene &scene)
+{
+  if (scene.eevee.filter_graph != nullptr) {
+    return;
+  }
+  nodes::filter_graph_sync_legacy_filter_materials(bmain, scene, true);
+}
+
+static void version_filter_graph_pass_resolution_scale_init(Main &bmain)
+{
+  for (Scene &scene : bmain.scenes) {
+    bNodeTree *filter_graph = scene.eevee.filter_graph;
+    if (filter_graph == nullptr ||
+        !STREQ(filter_graph->idname, nodes::eevee_filter_graph_tree_idname.c_str()))
+    {
+      continue;
+    }
+
+    bool changed = false;
+    for (bNode &node : filter_graph->nodes) {
+      if (node.type_legacy != EEVEE_FILTER_GRAPH_NODE_FILTER_MATERIAL || node.storage == nullptr) {
+        continue;
+      }
+      NodeEeveeFilterGraphFilterMaterial &storage =
+          *static_cast<NodeEeveeFilterGraphFilterMaterial *>(node.storage);
+      if (storage.resolution_scale <= 0.0f) {
+        storage.resolution_scale = 1.0f;
+        changed = true;
+      }
+    }
+    if (changed) {
+      BKE_ntree_update_tag_all(filter_graph);
+    }
+  }
 }
 
 void do_versions_after_linking_510(FileData *fd, Main *bmain)
@@ -786,6 +903,23 @@ void do_versions_after_linking_510(FileData *fd, Main *bmain)
         gp_style.fill_rgba[3] = 0.0f;
       }
     }
+  }
+
+  if (!MAIN_VERSION_FILE_ATLEAST(bmain, 501, 54) ||
+      !DNA_struct_member_exists(fd->filesdna, "SceneEEVEE", "bNodeTree", "*filter_graph"))
+  {
+    for (Scene &scene : bmain->scenes) {
+      version_scene_legacy_filter_materials_to_filter_graph(*bmain, scene);
+    }
+  }
+
+  if (!MAIN_VERSION_FILE_ATLEAST(bmain, 501, 55) ||
+      !DNA_struct_member_exists(fd->filesdna,
+                                "NodeEeveeFilterGraphFilterMaterial",
+                                "float",
+                                "resolution_scale"))
+  {
+    version_filter_graph_pass_resolution_scale_init(*bmain);
   }
 
   /**
@@ -870,7 +1004,7 @@ void blo_do_versions_510(FileData *fd, Library * /*lib*/, Main *bmain)
               const char *new_pass_name = legacy_pass_name_to_new_name(socket.name);
               STRNCPY(socket.name, new_pass_name);
               const char *new_pass_identifier = legacy_pass_name_to_new_name(socket.identifier);
-              STRNCPY(socket.identifier, new_pass_identifier);
+              version_node_socket_identifier_set(socket, new_pass_identifier);
             }
           }
         }
@@ -965,7 +1099,7 @@ void blo_do_versions_510(FileData *fd, Library * /*lib*/, Main *bmain)
   if (!MAIN_VERSION_FILE_ATLEAST(bmain, 501, 20)) {
     for (Scene &scene : bmain->scenes) {
       SequencerToolSettings *seq_ts = seq::tool_settings_ensure(&scene);
-      constexpr short SEQ_SNAP_TO_FRAME_RANGE_OLD = (1 << 8);
+      constexpr eSequencerSnapMode SEQ_SNAP_TO_FRAME_RANGE_OLD = eSequencerSnapMode(1 << 8);
       /* Snap to frame range was bit 8, now bit 9, to make room for snap to increment in bit 8.
        */
       if (seq_ts->snap_mode & SEQ_SNAP_TO_FRAME_RANGE_OLD) {
@@ -1111,6 +1245,7 @@ void blo_do_versions_510(FileData *fd, Library * /*lib*/, Main *bmain)
       else {
         mat.surface_cull_method = MA_SURFACE_CULL_NONE;
       }
+      mat._pad3[0] = 0;
 
       SET_FLAG_FROM_TEST(
           mat.blend_flag, mat.surface_cull_method == MA_SURFACE_CULL_BACK, MA_BL_CULL_BACKFACE);
@@ -1161,6 +1296,14 @@ void blo_do_versions_510(FileData *fd, Library * /*lib*/, Main *bmain)
 
   if (!MAIN_VERSION_FILE_ATLEAST(bmain, 501, 46)) {
     version_add_outline_control_freestyle_edge_input(bmain);
+  }
+
+  if (!MAIN_VERSION_FILE_ATLEAST(bmain, 501, 51)) {
+    version_add_outline_control_width_variation_input(bmain);
+  }
+
+  if (!MAIN_VERSION_FILE_ATLEAST(bmain, 501, 52)) {
+    version_replace_outline_control_width_variation(bmain);
   }
 
   if (!MAIN_VERSION_FILE_ATLEAST(bmain, 501, 47)) {

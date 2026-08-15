@@ -4,14 +4,12 @@
 
 [[node]]
 void node_scene_time(float scale,
-                     out float frame,
-                     out float seconds,
-                     out float timeline,
-                     out float scaled_frame)
+                     float &frame,
+                     float &seconds,
+                     float &timeline,
+                     float &scaled_frame)
 {
-  frame = uniform_buf.scene_time.frame;
-  seconds = uniform_buf.scene_time.seconds;
-  timeline = uniform_buf.scene_time.timeline;
+  scene_time_uniforms(seconds, frame, timeline);
 
   float scale_safe = (abs(scale) > 1e-8f) ? scale : 1.0f;
   scaled_frame = frame / scale_safe;

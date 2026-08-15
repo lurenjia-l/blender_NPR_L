@@ -488,7 +488,7 @@ static bool node_output_contains_unsupported_bake_dependency(
       return false;
     }
     const bNodeSocket *group_output_input = group_output_node->input_by_identifier(
-        output_socket->identifier);
+        UString(output_socket->identifier));
     const bNode *previous_group_node = group_node_by_tree.lookup_default(group_tree, nullptr);
     group_node_by_tree.add_overwrite(group_tree, node);
     const bool found = node_tree_contains_unsupported_bake_dependency(
@@ -506,7 +506,7 @@ static bool node_output_contains_unsupported_bake_dependency(
     const bNode *group_node = group_node_by_tree.lookup_default(&ntree, nullptr);
     if (output_socket != nullptr && group_node != nullptr) {
       if (const bNodeSocket *group_input = group_node->input_by_identifier(
-              output_socket->identifier))
+              UString(output_socket->identifier)))
       {
         const bNodeTree &owner_tree = group_node->owner_tree();
         owner_tree.ensure_topology_cache();
@@ -1504,6 +1504,9 @@ static void bind_bake_resources(PassSimple::Sub &sub, Instance &inst)
   sub.bind_resources(inst.sampling);
   sub.bind_resources(inst.volume_probes);
   sub.bind_resources(inst.sphere_probes);
+  /* Color Bake has no view-dependent planar-probe pass, but the 5.2 light-probe BSL table still
+   * declares its descriptors. Bind the sentinel resources instead of uninitialized live probes. */
+  sub.bind_resources(inst.planar_probes.dummy_resources);
 }
 
 static void draw_bake_light_shader_surface_context(
@@ -1549,9 +1552,12 @@ static bool draw_bake_groups(RenderEngine *engine,
                              const int height)
 {
   if (!primitive_mask.has_valid_pixels) {
-    std::fill_n(combined_pass->ibuf->float_buffer.data,
-                int64_t(width) * int64_t(height) * 4,
-                0.0f);
+    float *combined_data = combined_pass->ibuf->float_data_for_write();
+    if (combined_data == nullptr) {
+      eevee_bake_report_error(engine, "Eevee Color Bake failed to access the Combined pass buffer");
+      return false;
+    }
+    std::fill_n(combined_data, int64_t(width) * int64_t(height) * 4, 0.0f);
     return true;
   }
 
@@ -1631,8 +1637,10 @@ static bool draw_bake_groups(RenderEngine *engine,
 
     inst.volume_probes.set_view(view);
     inst.sphere_probes.set_view(view);
+    inst.shadows.set_view(view, int2(width, height), TelemetryShadowContext::Bake);
+    inst.uniform_data.data.push_update();
     inst.lights.set_view(view, int2(width, height));
-    inst.shadows.set_view(view, int2(width, height));
+    inst.shadows.render(view, int2(width, height));
     inst.lights.eval_uniform_light_shaders(view);
     if (inst.lights.needs_bake_light_shader()) {
       draw_bake_light_shader_surface_context(inst,
@@ -1694,8 +1702,14 @@ static bool draw_bake_groups(RenderEngine *engine,
   for (int64_t pixel_i : IndexRange(pixel_count)) {
     accumulated_color[pixel_i] *= sample_weight;
   }
-  std::memcpy(
-      combined_pass->ibuf->float_buffer.data, accumulated_color.data(), sizeof(float4) * pixel_count);
+  float *combined_data = combined_pass->ibuf->float_data_for_write();
+  if (combined_data == nullptr) {
+    eevee_bake_report_error(engine, "Eevee Color Bake failed to access the Combined pass buffer");
+    GPU_TEXTURE_FREE_SAFE(primitive_tx);
+    return false;
+  }
+  std::copy_n(
+      reinterpret_cast<const float *>(accumulated_color.data()), pixel_count * 4, combined_data);
   GPU_TEXTURE_FREE_SAFE(primitive_tx);
   return true;
 }
@@ -1790,17 +1804,25 @@ static bool run_gpu_bake(RenderEngine *engine,
       if (use_fallback_camera && bake_camera.object != nullptr) {
         inst.camera_orig_object = bake_camera.object;
         inst.camera_eval_object = bake_camera.object;
-        CameraData bake_camera_data;
-        if (camera_data_from_object(
-                inst.scene, bake_camera.object, int2(width, height), bake_camera_data))
-        {
-          inst.camera.override(bake_camera_data, true);
-        }
       }
 
       draw::Manager &manager = *inst.manager;
       manager.begin_sync();
       inst.begin_sync();
+
+      Object *bake_camera_object = inst.camera_eval_object ? inst.camera_eval_object :
+                                                            camera_object;
+      if (use_fallback_camera && bake_camera.object != nullptr) {
+        inst.camera_orig_object = bake_camera.object;
+        inst.camera_eval_object = bake_camera.object;
+        bake_camera_object = bake_camera.object;
+      }
+      CameraData bake_camera_data;
+      if (camera_data_from_object(inst.scene, bake_camera_object, int2(width, height), bake_camera_data))
+      {
+        inst.camera.override(bake_camera_data, true);
+      }
+
       sync_scene_for_bake(engine, depsgraph, inst);
 
       draw::ObjectRef object_ref(object);
@@ -1844,7 +1866,7 @@ static bool run_gpu_bake(RenderEngine *engine,
           break;
         }
 
-        inst.manager->register_layer_attributes(gpumat);
+        inst.manager->register_material_resources(gpumat);
         gpu_materials.append(gpumat);
 
         BakeDrawGroup group;
@@ -1867,9 +1889,15 @@ static bool run_gpu_bake(RenderEngine *engine,
             engine, inst, draw_groups, resource_handle, primitive_mask, combined_pass, width, height);
       }
       else if (ok) {
-        std::fill_n(combined_pass->ibuf->float_buffer.data,
-                    int64_t(width) * int64_t(height) * 4,
-                    0.0f);
+        float *combined_data = combined_pass->ibuf->float_data_for_write();
+        if (combined_data == nullptr) {
+          eevee_bake_report_error(engine,
+                                  "Eevee Color Bake failed to access the Combined pass buffer");
+          ok = false;
+        }
+        else {
+          std::fill_n(combined_data, int64_t(width) * int64_t(height) * 4, 0.0f);
+        }
       }
 
       for (BakeDrawGroup &group : draw_groups) {
@@ -1921,7 +1949,7 @@ void eevee_bake(RenderEngine *engine,
   RenderLayer *layer = static_cast<RenderLayer *>(result->layers.first);
   RenderPass *combined_pass = RE_pass_find_by_name(layer, RE_PASSNAME_COMBINED, "");
   if (combined_pass == nullptr || combined_pass->ibuf == nullptr ||
-      combined_pass->ibuf->float_buffer.data == nullptr)
+      combined_pass->ibuf->float_data_for_write() == nullptr)
   {
     RE_engine_end_result(engine, result, true, false, false);
     eevee_bake_report_error(engine, "Eevee Color Bake failed to allocate Combined pass");

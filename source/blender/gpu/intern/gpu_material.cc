@@ -8,22 +8,31 @@
  * Manages materials, lights and textures.
  */
 
+#include <climits>
 #include <cstring>
+#include <mutex>
+#include <unordered_map>
 
 #include "BKE_lib_id.hh"
 #include "MEM_guardedalloc.h"
 
 #include "DNA_material_types.h"
 #include "DNA_light_types.h"
+#include "DNA_object_types.h"
 #include "DNA_scene_types.h"
 #include "DNA_world_types.h"
 
 #include "BLI_listbase.h"
 #include "BLI_math_vector.h"
+#include "BLI_set.hh"
 #include "BLI_string.h"
 #include "BLI_time.h"
 #include "BLI_utildefines.h"
+#include "BLI_array.hh"
+#include "BLI_map.hh"
 #include "BLI_vector.hh"
+
+#include <utility>
 
 #include "BKE_main.hh"
 #include "BKE_material.hh"
@@ -50,6 +59,14 @@ namespace blender {
 static void gpu_material_ramp_texture_build(GPUMaterial *mat);
 static void gpu_material_sky_texture_build(GPUMaterial *mat);
 
+static std::unordered_map<const Material *, int> g_material_recompile_serials;
+static std::mutex g_material_recompile_serials_mutex;
+
+static const Material *gpu_material_recompile_serial_key(const Material *material)
+{
+  return material->id.orig_id ? reinterpret_cast<const Material *>(material->id.orig_id) : material;
+}
+
 /* Structs */
 #define MAX_COLOR_BAND 128
 #define MAX_GPU_SKIES 8
@@ -62,6 +79,18 @@ struct GPUColorBandBuilder {
 struct GPUSkyBuilder {
   float pixels[MAX_GPU_SKIES][GPU_SKY_WIDTH * GPU_SKY_HEIGHT][4];
   int current_layer;
+};
+
+struct GPUMaterialClosureCallbackInputStorage {
+  int closure_output_node_id;
+  std::string item_key;
+  GPUType type;
+  int function_input_index;
+};
+
+struct GPUMaterialClosureCallbackFrameStorage {
+  Vector<GPUMaterialClosureCallbackInputStorage> inputs;
+  std::string error;
 };
 
 struct GPUMaterial {
@@ -85,8 +114,9 @@ struct GPUMaterial {
   /* Number of generated function. */
   int generated_function_len = 0;
 
-  /* Source material, might be null. */
+  /* Source material, might be null for worlds and lights. */
   Material *source_material = nullptr;
+  bool is_world = false;
   /* 1D Texture array containing all color bands. */
   gpu::Texture *coba_tex = nullptr;
   /* Builder for coba_tex. */
@@ -97,6 +127,8 @@ struct GPUMaterial {
   GPUSkyBuilder *sky_builder = nullptr;
   /* Low level node graph(s). Also contains resources needed by the material. */
   GPUNodeGraph graph = {};
+  bool uses_referenced_object_data = false;
+  Vector<GPUReferencedObject> referenced_objects;
   Vector<Object *> filter_object_infos;
   Vector<Object *> filter_mask_objects;
   Vector<GPUMaterialGeneratedSource> generated_sources;
@@ -104,6 +136,7 @@ struct GPUMaterial {
   Vector<GPUType> closure_uv_source_type_stack;
   Vector<std::string> closure_uv_dx_source_stack;
   Vector<std::string> closure_uv_dy_source_stack;
+  Vector<GPUMaterialClosureCallbackFrameStorage> closure_callback_input_frame_stack;
 
   bool has_surface_output = false;
   bool has_volume_output = false;
@@ -113,6 +146,7 @@ struct GPUMaterial {
   bool has_light_shader_output = false;
   bool has_glsl_light_shader_eval = false;
   bool has_shader_info_shadow_classification = false;
+  bool uses_hiz_data = false;
 
   std::string name;
 
@@ -142,6 +176,32 @@ struct GPUMaterial {
     }
   }
 };
+
+static void gpu_material_force_glsl_closure_callback_inline_error(
+    GPUMaterial *material, const StringRef helper_name)
+{
+  static constexpr StringRefNull failure_name = "glsl_closure_callback_inline_failure";
+  static constexpr StringRefNull failure_filename =
+      "glsl_closure_callback_inline_failure.glsl";
+  const std::string source = "#error GLSL_closure_callback_" + std::string(helper_name) +
+                             "_inline_failed\n";
+  GPU_material_generated_source_add(material, failure_filename, {}, source);
+
+  GPUNodeStack failure_output[2] = {};
+  failure_output[0].type = GPU_CLOSURE;
+  failure_output[0].hasoutput = true;
+  failure_output[1].end = true;
+  if (GPU_stack_link_custom(material,
+                            nullptr,
+                            failure_name,
+                            failure_filename,
+                            GPU_CUSTOM_NODE_DEPENDENCY_NONE,
+                            nullptr,
+                            failure_output))
+  {
+    GPU_material_output_surface(material, failure_output[0].link);
+  }
+}
 
 /* Public API */
 
@@ -176,6 +236,7 @@ GPUMaterialFromNodeTreeResult GPU_material_from_nodetree(
 
   GPUMaterial *mat = MEM_new<GPUMaterial>(__func__, engine);
   mat->source_material = ma;
+  mat->is_world = (ma == nullptr) && compile_surface_graph && !compile_light_shader_graph;
   mat->uuid = shader_uuid;
   mat->name = name;
   result.material = mat;
@@ -186,12 +247,25 @@ GPUMaterialFromNodeTreeResult GPU_material_from_nodetree(
     /* Localize tree to create links for reroute and mute. */
     localtree = bke::node_tree_add_tree(
         nullptr, (StringRef(ntree->id.name) + " Inlined").c_str(), ntree->idname);
+    localtree->flag |= NTREE_IS_GPU_SHADER_INTERNAL;
     nodes::InlineShaderNodeTreeParams inline_params;
     inline_params.allow_preserving_repeat_zones = true;
     inline_params.target_engine_ = engine == GPU_MAT_EEVEE ? SHD_OUTPUT_EEVEE : SHD_OUTPUT_ALL;
-    nodes::inline_shader_node_tree(*ntree, *localtree, inline_params);
+    const bool inline_success = nodes::inline_shader_node_tree(*ntree, *localtree, inline_params);
 
+    std::string callback_inline_failure_helper;
     for (nodes::InlineShaderNodeTreeParams::ErrorMessage &error : inline_params.r_error_messages) {
+      if (!inline_success && callback_inline_failure_helper.empty()) {
+        const StringRef message(error.message);
+        static constexpr StringRef prefix = "GLSL closure callback '";
+        if (message.startswith(prefix)) {
+          const StringRef helper_and_suffix = message.drop_prefix(prefix.size());
+          const int64_t helper_end = helper_and_suffix.find("'");
+          if (helper_end != StringRef::not_found) {
+            callback_inline_failure_helper = helper_and_suffix.substr(0, helper_end);
+          }
+        }
+      }
       result.errors.append({error.node, std::move(error.message)});
     }
 
@@ -200,6 +274,10 @@ GPUMaterialFromNodeTreeResult GPU_material_from_nodetree(
     }
     if (compile_light_shader_graph) {
       ntreeGPULightShaderNodes(localtree, mat);
+    }
+    if (!inline_success && !callback_inline_failure_helper.empty()) {
+      gpu_material_force_glsl_closure_callback_inline_error(
+          mat, callback_inline_failure_helper);
     }
   }
   if (compile_npr_graph) {
@@ -311,7 +389,7 @@ void GPU_material_free(ListBaseT<LinkData> *gpumaterial)
     GPUMaterial *material = static_cast<GPUMaterial *>(link.data);
     GPU_material_free_single(material);
   }
-  BLI_freelistN(gpumaterial);
+  gpumaterial->free_no_destruct();
 }
 
 void GPU_materials_free(Main *bmain)
@@ -344,6 +422,11 @@ uint64_t GPU_material_uuid_get(GPUMaterial *mat)
 Material *GPU_material_get_material(GPUMaterial *material)
 {
   return material->source_material;
+}
+
+bool GPU_material_is_world(const GPUMaterial *material)
+{
+  return material->is_world;
 }
 
 GPUPass *GPU_material_get_pass(GPUMaterial *material)
@@ -394,6 +477,45 @@ uint64_t GPU_material_compilation_timestamp(GPUMaterial *mat)
   return GPU_pass_compilation_timestamp(mat->pass);
 }
 
+double GPU_material_compilation_time(GPUMaterial *mat)
+{
+  return GPU_pass_compilation_time(GPU_material_get_pass(mat));
+}
+
+int GPU_material_recompile_serial_get(const GPUMaterial *mat)
+{
+  if (mat->source_material == nullptr) {
+    return 0;
+  }
+
+  const Material *source_material = gpu_material_recompile_serial_key(mat->source_material);
+  std::lock_guard lock(g_material_recompile_serials_mutex);
+  const auto serial = g_material_recompile_serials.find(source_material);
+  return serial == g_material_recompile_serials.end() ? 0 : serial->second;
+}
+
+void GPU_material_recompile_serial_increment(Material *material)
+{
+  if (material == nullptr) {
+    return;
+  }
+
+  const Material *source_material = gpu_material_recompile_serial_key(material);
+  std::lock_guard lock(g_material_recompile_serials_mutex);
+  int &serial = g_material_recompile_serials[source_material];
+  serial = (serial == INT_MAX) ? 1 : serial + 1;
+}
+
+void GPU_material_recompile_serial_clear(const Material *material)
+{
+  if (material == nullptr) {
+    return;
+  }
+
+  std::lock_guard lock(g_material_recompile_serials_mutex);
+  g_material_recompile_serials.erase(material);
+}
+
 bool GPU_material_has_surface_output(GPUMaterial *mat)
 {
   return mat->has_surface_output;
@@ -434,6 +556,11 @@ bool GPU_material_has_shader_info_shadow_classification(const GPUMaterial *mat)
   return mat != nullptr && mat->has_shader_info_shadow_classification;
 }
 
+bool GPU_material_uses_hiz_data(const GPUMaterial *mat)
+{
+  return mat != nullptr && mat->uses_hiz_data;
+}
+
 int GPU_material_filter_object_info_ensure(GPUMaterial *material, Object *object)
 {
   if (material == nullptr || object == nullptr) {
@@ -447,6 +574,78 @@ int GPU_material_filter_object_info_ensure(GPUMaterial *material, Object *object
 
   material->filter_object_infos.append(object);
   return material->filter_object_infos.size() - 1;
+}
+
+static Object *gpu_material_referenced_object_original(Object *object)
+{
+  if (object == nullptr) {
+    return nullptr;
+  }
+  if (object->id.orig_id != nullptr) {
+    return reinterpret_cast<Object *>(object->id.orig_id);
+  }
+  return object;
+}
+
+uint32_t GPU_material_referenced_object_ensure(GPUMaterial *material,
+                                               Object *object,
+                                               eGPUReferencedObjectDataFlag flags)
+{
+  if (material == nullptr) {
+    return 0;
+  }
+  material->uses_referenced_object_data = true;
+
+  Object *original = gpu_material_referenced_object_original(object);
+  if (original == nullptr) {
+    return 0;
+  }
+
+  /* Temporary Main IDs intentionally do not receive session UIDs. Referenced-object requests
+   * from runtime-only graphs must degrade to the shader default instead of tripping the UID assert. */
+  if (original->id.tag & ID_TAG_TEMP_MAIN) {
+    return 0;
+  }
+  if (original->id.session_uid == 0) {
+    BKE_lib_libblock_session_uid_ensure(&original->id);
+  }
+  const uint32_t session_uid = original->id.session_uid;
+  if (session_uid == 0) {
+    return 0;
+  }
+
+  for (GPUReferencedObject &entry : material->referenced_objects) {
+    if (entry.session_uid == session_uid) {
+      entry.flags |= flags;
+      return session_uid;
+    }
+  }
+
+  GPUReferencedObject entry;
+  entry.object = original;
+  entry.session_uid = session_uid;
+  entry.flags = flags;
+  material->referenced_objects.append(entry);
+  return session_uid;
+}
+
+bool GPU_material_uses_referenced_object_data(const GPUMaterial *material)
+{
+  return material != nullptr && material->uses_referenced_object_data;
+}
+
+int GPU_material_referenced_object_count(const GPUMaterial *material)
+{
+  return (material != nullptr) ? material->referenced_objects.size() : 0;
+}
+
+const GPUReferencedObject *GPU_material_referenced_object_get(const GPUMaterial *material,
+                                                              int index)
+{
+  if (material == nullptr || index < 0 || index >= material->referenced_objects.size()) {
+    return nullptr;
+  }
+  return &material->referenced_objects[index];
 }
 
 int GPU_material_filter_object_info_count(const GPUMaterial *material)
@@ -592,7 +791,7 @@ const GPUUniformAttrList *GPU_material_uniform_attributes(const GPUMaterial *mat
 const ListBaseT<GPULayerAttr> *GPU_material_layer_attributes(const GPUMaterial *material)
 {
   const ListBaseT<GPULayerAttr> *attrs = &material->graph.layer_attrs;
-  return !BLI_listbase_is_empty(attrs) ? attrs : nullptr;
+  return !attrs->is_empty() ? attrs : nullptr;
 }
 
 GPUNodeGraph *gpu_material_node_graph(GPUMaterial *material)
@@ -678,6 +877,99 @@ void GPU_material_closure_uv_gradient_source_get(const GPUMaterial *material,
   }
   r_dx_source = material->closure_uv_dx_source_stack.last();
   r_dy_source = material->closure_uv_dy_source_stack.last();
+}
+
+void GPU_material_closure_callback_input_frame_push(GPUMaterial *material,
+                                                    Span<GPUMaterialClosureCallbackInput> inputs)
+{
+  if (material == nullptr) {
+    return;
+  }
+
+  GPUMaterialClosureCallbackFrameStorage frame;
+  frame.inputs.reserve(inputs.size());
+  for (const GPUMaterialClosureCallbackInput &input : inputs) {
+    GPUMaterialClosureCallbackInputStorage stored_input;
+    stored_input.closure_output_node_id = input.closure_output_node_id;
+    stored_input.item_key = std::string(input.item_key.data(), size_t(input.item_key.size()));
+    stored_input.type = input.type;
+    stored_input.function_input_index = input.function_input_index;
+    frame.inputs.append(std::move(stored_input));
+  }
+  material->closure_callback_input_frame_stack.append(std::move(frame));
+}
+
+void GPU_material_closure_callback_input_frame_pop(GPUMaterial *material)
+{
+  if (material == nullptr || material->closure_callback_input_frame_stack.is_empty()) {
+    return;
+  }
+  material->closure_callback_input_frame_stack.pop_last();
+}
+
+bool GPU_material_closure_callback_input_find(const GPUMaterial *material,
+                                              const int closure_output_node_id,
+                                              const StringRef item_key,
+                                              GPUType &r_type,
+                                              int &r_function_input_index,
+                                              bool &r_is_ancestor_capture)
+{
+  r_type = GPU_NONE;
+  r_function_input_index = -1;
+  r_is_ancestor_capture = false;
+  if (material == nullptr || material->closure_callback_input_frame_stack.is_empty()) {
+    return false;
+  }
+
+  const auto &frames = material->closure_callback_input_frame_stack;
+  for (const GPUMaterialClosureCallbackInputStorage &input : frames.last().inputs) {
+    if (input.closure_output_node_id == closure_output_node_id &&
+        StringRef(input.item_key) == item_key)
+    {
+      r_type = input.type;
+      r_function_input_index = input.function_input_index;
+      return true;
+    }
+  }
+
+  /* Inputs from an outer callback function are not in scope in the nested function. Treat them as
+   * an unsupported capture instead of aliasing their inN index to the nested frame. */
+  for (int64_t frame_index = frames.size() - 1; frame_index-- > 0;) {
+    for (const GPUMaterialClosureCallbackInputStorage &input : frames[frame_index].inputs) {
+      if (input.closure_output_node_id == closure_output_node_id &&
+          StringRef(input.item_key) == item_key)
+      {
+        r_is_ancestor_capture = true;
+        return false;
+      }
+    }
+  }
+  return false;
+}
+
+bool GPU_material_closure_callback_input_frame_error_set(GPUMaterial *material,
+                                                         const StringRef error)
+{
+  if (material == nullptr || material->closure_callback_input_frame_stack.is_empty()) {
+    return false;
+  }
+  GPUMaterialClosureCallbackFrameStorage &frame =
+      material->closure_callback_input_frame_stack.last();
+  if (frame.error.empty()) {
+    frame.error = std::string(error);
+  }
+  return true;
+}
+
+bool GPU_material_closure_callback_input_frame_error_get(const GPUMaterial *material,
+                                                         std::string &r_error)
+{
+  r_error.clear();
+  if (material == nullptr || material->closure_callback_input_frame_stack.is_empty()) {
+    return false;
+  }
+  r_error = material->closure_callback_input_frame_stack.last().error;
+  return !r_error.empty();
 }
 
 /* Resources */
@@ -830,10 +1122,23 @@ void GPU_material_output_npr(GPUMaterial *material, GPUNodeLink *link)
 
 void GPU_material_output_filter(GPUMaterial *material, GPUNodeLink *link)
 {
+  GPU_material_output_filter_item(material, 0, link);
+}
+
+void GPU_material_output_filter_item(GPUMaterial *material, int identifier, GPUNodeLink *link)
+{
   if (link != nullptr && !material->graph.outlink_filter) {
     material->graph.outlink_filter = link;
     material->has_filter_output = true;
   }
+  if (link == nullptr) {
+    return;
+  }
+  GPUNodeGraphOutputLink *filter_link = MEM_new<GPUNodeGraphOutputLink>(__func__);
+  filter_link->hash = identifier;
+  filter_link->outlink = link;
+  BLI_addtail(&material->graph.outlink_filters, filter_link);
+  material->has_filter_output = true;
 }
 
 void GPU_material_output_light_shader(GPUMaterial *material, GPUNodeLink *link)
@@ -855,6 +1160,13 @@ void GPU_material_shader_info_shadow_classification_set(GPUMaterial *material)
 {
   if (material != nullptr) {
     material->has_shader_info_shadow_classification = true;
+  }
+}
+
+void GPU_material_hiz_data_set(GPUMaterial *material)
+{
+  if (material != nullptr) {
+    material->uses_hiz_data = true;
   }
 }
 
@@ -880,11 +1192,68 @@ void GPU_material_add_output_link_composite(GPUMaterial *material, GPUNodeLink *
   BLI_addtail(&material->graph.outlink_compositor, compositor_link);
 }
 
+static bool gpu_node_link_uses_closure_callback_input(const GPUNodeGraph &graph,
+                                                      const GPUNodeLink *root_link)
+{
+  if (root_link == nullptr) {
+    return false;
+  }
+  if (root_link->link_type == GPU_NODE_LINK_FUNCTION_CALL) {
+    return root_link->function_call != nullptr &&
+           StringRef(root_link->function_call).startswith("$OUT = in");
+  }
+  if (root_link->link_type != GPU_NODE_LINK_OUTPUT || root_link->output == nullptr) {
+    return false;
+  }
+
+  Set<const GPUNode *> visited_nodes;
+  Vector<const GPUNode *> nodes_to_visit;
+  nodes_to_visit.append(root_link->output->node);
+  while (!nodes_to_visit.is_empty()) {
+    const GPUNode *node = nodes_to_visit.pop_last();
+    if (node == nullptr || !visited_nodes.add(node)) {
+      continue;
+    }
+    for (const GPUInput &input : node->inputs) {
+      if (input.source == GPU_SOURCE_FUNCTION_CALL && input.function_call != nullptr &&
+          StringRef(input.function_call).startswith("$OUT = in"))
+      {
+        return true;
+      }
+      if (input.source == GPU_SOURCE_OUTPUT && input.link != nullptr &&
+          input.link->output != nullptr)
+      {
+        nodes_to_visit.append(input.link->output->node);
+      }
+    }
+
+    /* Zone start nodes are implicit dependencies of their matching zone end nodes. */
+    if (node->is_zone_end) {
+      for (const GPUNode &zone_node : graph.nodes) {
+        if (zone_node.zone_index == node->zone_index && !zone_node.is_zone_end) {
+          nodes_to_visit.append(&zone_node);
+        }
+      }
+    }
+  }
+  return false;
+}
+
 char *GPU_material_split_sub_function(GPUMaterial *material,
                                       GPUType return_type,
                                       GPUNodeLink **link,
                                       StringRefNull dependency_name)
 {
+  if (!material->closure_callback_input_frame_stack.is_empty() &&
+      gpu_node_link_uses_closure_callback_input(material->graph,
+                                                link != nullptr ? *link : nullptr))
+  {
+    GPU_material_closure_callback_input_frame_error_set(
+        material,
+        "Callback input-dependent graph cannot be captured by a legacy zero-input GPU "
+        "sub-function");
+  }
+
   /* Force cast to return type. */
   switch (return_type) {
     case GPU_FLOAT:
@@ -902,11 +1271,111 @@ char *GPU_material_split_sub_function(GPUMaterial *material,
   }
 
   GPUNodeGraphFunctionLink *func_link = MEM_new_zeroed<GPUNodeGraphFunctionLink>(__func__);
+  func_link->mode = GPU_NODE_GRAPH_FUNCTION_LEGACY;
   func_link->outlink = *link;
   func_link->return_type = return_type;
   SNPRINTF(func_link->name, "ntree_fn%d", material->generated_function_len++);
   if (!dependency_name.is_empty()) {
     BLI_strncpy(func_link->dependency_name, dependency_name.c_str(), sizeof(func_link->dependency_name));
+  }
+  BLI_addtail(&material->graph.material_functions, func_link);
+
+  return func_link->name;
+}
+
+static bool gpu_material_sub_function_type_supported(const GPUType type)
+{
+  return ELEM(type, GPU_FLOAT, GPU_VEC3, GPU_VEC4);
+}
+
+char *GPU_material_split_sub_function_multi(GPUMaterial *material,
+                                            const Span<GPUType> input_types,
+                                            const Span<GPUMaterialFunctionOutput> outputs,
+                                            const StringRefNull dependency_name)
+{
+  BLI_assert(material != nullptr);
+  BLI_assert(!outputs.is_empty());
+  BLI_assert(input_types.size() <= INT_MAX && outputs.size() <= INT_MAX);
+  if (material == nullptr || outputs.is_empty() || input_types.size() > INT_MAX ||
+      outputs.size() > INT_MAX)
+  {
+    return nullptr;
+  }
+
+  for (const GPUType type : input_types) {
+    BLI_assert(gpu_material_sub_function_type_supported(type));
+    if (!gpu_material_sub_function_type_supported(type)) {
+      return nullptr;
+    }
+  }
+  for (const GPUMaterialFunctionOutput &output : outputs) {
+    BLI_assert(gpu_material_sub_function_type_supported(output.type));
+    BLI_assert(output.link != nullptr && *output.link != nullptr);
+    if (!gpu_material_sub_function_type_supported(output.type) || output.link == nullptr ||
+        *output.link == nullptr)
+    {
+      return nullptr;
+    }
+  }
+
+  /* Force every graph output to its declared function output type. Outputs that share the same
+   * source link and type are serialized once so a shared value (e.g. one nested callback result
+   * feeding several closure outputs) is not duplicated. */
+  Map<std::pair<GPUNodeLink *, GPUType>, GPUNodeLink *> shared_serialized;
+  Array<GPUNodeLink *> serialized_outlinks(outputs.size());
+  for (const int64_t index : outputs.index_range()) {
+    const GPUMaterialFunctionOutput &output = outputs[index];
+    GPUNodeLink *source = *output.link;
+    const std::pair<GPUNodeLink *, GPUType> key(source, output.type);
+    if (GPUNodeLink *const *found = shared_serialized.lookup_ptr(key)) {
+      serialized_outlinks[index] = *found;
+      if (source->link_type != GPU_NODE_LINK_OUTPUT) {
+        gpu_node_link_discard(source);
+      }
+      continue;
+    }
+    GPUNodeLink *serialized = nullptr;
+    bool linked = false;
+    switch (output.type) {
+      case GPU_FLOAT:
+        linked = GPU_link(material, "set_value", source, &serialized);
+        break;
+      case GPU_VEC3:
+        linked = GPU_link(material, "set_rgb", source, &serialized);
+        break;
+      case GPU_VEC4:
+        linked = GPU_link(material, "set_rgba", source, &serialized);
+        break;
+      default:
+        BLI_assert_unreachable();
+        break;
+    }
+    if (!linked) {
+      return nullptr;
+    }
+    shared_serialized.add_new(key, serialized);
+    serialized_outlinks[index] = serialized;
+  }
+
+  GPUNodeGraphFunctionLink *func_link = MEM_new_zeroed<GPUNodeGraphFunctionLink>(__func__);
+  func_link->mode = GPU_NODE_GRAPH_FUNCTION_MULTI_IO;
+  func_link->input_types_len = int(input_types.size());
+  if (!input_types.is_empty()) {
+    func_link->input_types = MEM_new_array<GPUType>(input_types.size(), __func__);
+    for (const int64_t index : input_types.index_range()) {
+      func_link->input_types[index] = input_types[index];
+    }
+  }
+  func_link->outputs_len = int(outputs.size());
+  func_link->outputs = MEM_new_array<GPUNodeGraphFunctionOutput>(outputs.size(), __func__);
+  for (const int64_t index : outputs.index_range()) {
+    func_link->outputs[index].type = outputs[index].type;
+    func_link->outputs[index].outlink = serialized_outlinks[index];
+  }
+  SNPRINTF(func_link->name, "ntree_fn%d", material->generated_function_len++);
+  if (!dependency_name.is_empty()) {
+    BLI_strncpy(
+        func_link->dependency_name, dependency_name.c_str(), sizeof(func_link->dependency_name));
   }
   BLI_addtail(&material->graph.material_functions, func_link);
 

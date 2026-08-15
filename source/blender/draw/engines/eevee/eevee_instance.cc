@@ -8,15 +8,15 @@
   * An instance contains all structures needed to do a complete render.
   */
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
-#include <sstream>
 
 #include "CLG_log.h"
 
 #include "BKE_global.hh"
 #include "BKE_object.hh"
-#include "BKE_scene_runtime.hh"
+#include "BKE_scene.hh"
 
 #include "BLI_rect.h"
 #include "BLI_time.h"
@@ -68,7 +68,6 @@ namespace blender::eevee
 
   void Instance::init()
   {
-    telemetry.reset();
     this->draw_ctx = DRW_context_get();
 
     Depsgraph* depsgraph = draw_ctx->depsgraph;
@@ -97,7 +96,7 @@ namespace blender::eevee
       if (camera)
       {
         if (scene->r.mode & R_BORDER) {
-          if (draw_ctx->is_viewport_image_render()) {
+          if (draw_ctx->is_viewport_image_render() || draw_ctx->is_viewport_xr()) {
             rect.xmin = scene->r.border.xmin * size[0];
             rect.ymin = scene->r.border.ymin * size[1];
             rect.xmax = scene->r.border.xmax * size[0];
@@ -129,7 +128,7 @@ namespace blender::eevee
         rect.ymax = v3d->render_border.ymax * size[1];
       }
 
-      if (draw_ctx->is_viewport_image_render())
+      if (draw_ctx->is_viewport_image_render() || draw_ctx->is_viewport_xr())
       {
         const float2 vp_size = draw_ctx->viewport_size_get();
         visible_rect.xmax = vp_size[0];
@@ -143,6 +142,24 @@ namespace blender::eevee
     }
 
     init(size, &rect, &visible_rect, nullptr, depsgraph, camera, nullptr, &default_view, v3d, rv3d);
+  }
+
+  bool Instance::performance_capture_requested(const DRWContext &draw_ctx) const
+  {
+    if (draw_ctx.scene == nullptr ||
+        (draw_ctx.scene->eevee.flag & SCE_EEVEE_PERFORMANCE_PROFILER) == 0)
+    {
+      return false;
+    }
+
+    /* Draw performance is a shared viewport ledger. Final renders and auxiliary selection/XR
+     * loops have their own lifetimes and must not be mixed into it. */
+    return ELEM(draw_ctx.mode, DRWContext::VIEWPORT, DRWContext::VIEWPORT_RENDER);
+  }
+
+  void Instance::performance_frame_end(const DrawPerformanceMetrics &metrics)
+  {
+    telemetry.draw_performance_end(metrics);
   }
 
   void Instance::init(const int2& output_res,
@@ -167,6 +184,13 @@ namespace blender::eevee
     rv3d = rv3d_;
     manager = DRW_manager_get();
     update_eval_members();
+    Scene *telemetry_scene = DEG_get_input_scene(depsgraph);
+    if (telemetry_scene == nullptr) {
+      telemetry_scene = scene;
+    }
+    const bool telemetry_source_changed = telemetry.source_binding_update(
+      telemetry_scene ? telemetry_scene->id.session_uid : 0,
+      view_layer ? view_layer->name : "");
 
     info_ = "";
 
@@ -180,13 +204,30 @@ namespace blender::eevee
       is_transforming = draw_ctx->is_transforming();
       draw_overlays = v3d && (v3d->flag2 & V3D_HIDE_OVERLAYS) == 0;
 
+      if (telemetry_source_changed) {
+        sampling.reset();
+      }
+      if (is_playback) {
+        sampling.reset();
+      }
+
       /* Note: Do not update the value here as we use it during sync for checking ID updates. */
       if (depsgraph_last_update_ != DEG_get_update_count(depsgraph))
       {
         sampling.reset();
       }
       const bool profiler_enabled = telemetry.enabled();
-      if (assign_if_different(profiler_enabled_, profiler_enabled))
+      const int output_offset_x = output_rect ? output_rect->xmin : 0;
+      const int output_offset_y = output_rect ? output_rect->ymin : 0;
+      const int output_extent_x = output_rect ? BLI_rcti_size_x(output_rect) : output_res.x;
+      const int output_extent_y = output_rect ? BLI_rcti_size_y(output_rect) : output_res.y;
+      if (telemetry.epoch_inputs_update(profiler_enabled,
+                                        output_res.x,
+                                        output_res.y,
+                                        output_offset_x,
+                                        output_offset_y,
+                                        output_extent_x,
+                                        output_extent_y))
       {
         sampling.reset();
       }
@@ -199,10 +240,7 @@ namespace blender::eevee
       {
         sampling.reset();
       }
-      if (output_res != film.display_extent_get())
-      {
-        sampling.reset();
-      }
+      /* The shared telemetry source owns the resolution epoch. */
       if (output_rect)
       {
         int2 offset = int2(output_rect->xmin, output_rect->ymin);
@@ -213,6 +251,27 @@ namespace blender::eevee
         }
       }
       if (assign_if_different(overlays_enabled_, v3d && !(v3d->flag2 & V3D_HIDE_OVERLAYS)))
+      {
+        sampling.reset();
+      }
+      const bool is_material_or_rendered =
+        v3d && ELEM(v3d->shading.type, OB_MATERIAL, OB_RENDER);
+      const bool show_shadow_lod = draw_overlays && is_material_or_rendered &&
+        (v3d->overlay.flag & V3D_OVERLAY_SHOW_SHADOW_LOD);
+      if (assign_if_different(shadow_lod_overlay_, show_shadow_lod))
+      {
+        sampling.reset();
+      }
+      const int shadow_lod_opacity_encoded = v3d ?
+                                                  ((v3d->overlay.flag &
+                                                    V3D_OVERLAY_SHADOW_LOD_OPACITY_MASK) >>
+                                                   V3D_OVERLAY_SHADOW_LOD_OPACITY_SHIFT) :
+                                                  0;
+      const int shadow_lod_opacity_percent = shadow_lod_opacity_encoded == 0 ?
+                                               V3D_OVERLAY_SHADOW_LOD_OPACITY_DEFAULT :
+                                               shadow_lod_opacity_encoded - 1;
+      const float shadow_lod_opacity = float(shadow_lod_opacity_percent) * 0.01f;
+      if (assign_if_different(shadow_lod_overlay_opacity_, shadow_lod_opacity))
       {
         sampling.reset();
       }
@@ -229,7 +288,22 @@ namespace blender::eevee
     else
     {
       is_image_render = true;
+      shadow_lod_overlay_ = false;
+      shadow_lod_overlay_opacity_ = 0.7f;
     }
+
+    rcti lookdev_rect = *visible_rect;
+    if (is_viewport() && v3d && rv3d && rv3d->persp == RV3D_CAMOB && v3d->camera &&
+        !draw_ctx->is_viewport_image_render() && !draw_ctx->is_viewport_xr())
+    {
+      rctf camera_border;
+      /* Anchor reference spheres to camera border. */
+      ED_view3d_calc_camera_border(
+          scene, depsgraph, draw_ctx->region, v3d, rv3d, false, &camera_border);
+      BLI_rcti_rctf_copy(&lookdev_rect, &camera_border);
+    }
+
+    anisotropic_filtering = GPU_anisotropic_filtering_flags(scene->r.anisotropic_filter);
 
     sampling.init(scene);
     camera.init();
@@ -251,7 +325,7 @@ namespace blender::eevee
     sphere_probes.init();
     volume_probes.init();
     volume.init();
-    lookdev.init(visible_rect);
+    lookdev.init(&lookdev_rect);
 
     /* Request static shaders */
     ShaderGroups shader_request = DEFERRED_LIGHTING_SHADERS | SHADOW_SHADERS | FILM_SHADERS |
@@ -261,8 +335,9 @@ namespace blender::eevee
     SET_FLAG_FROM_TEST(shader_request, needs_planar_probe_passes(), DEFERRED_PLANAR_SHADERS);
     SET_FLAG_FROM_TEST(shader_request, needs_lightprobe_sphere_passes(), DEFERRED_CAPTURE_SHADERS);
     SET_FLAG_FROM_TEST(shader_request, motion_blur.postfx_enabled(), MOTION_BLUR_SHADERS);
-    SET_FLAG_FROM_TEST(shader_request, raytracing.use_fast_gi(), HORIZON_SCAN_SHADERS);
+    SET_FLAG_FROM_TEST(shader_request, raytracing.use_fast_gi(), FAST_GI_SHADERS);
     SET_FLAG_FROM_TEST(shader_request, raytracing.use_raytracing(), RAYTRACING_SHADERS);
+    SET_FLAG_FROM_TEST(shader_request, scene->eevee.filter_graph != nullptr, FILTER_GRAPH_SHADERS);
 
     loaded_shaders = ShaderGroups::NONE;
     loaded_shaders |= shaders.static_shaders_load_async(shader_request);
@@ -300,7 +375,7 @@ namespace blender::eevee
 
   void Instance::init_light_bake(Depsgraph* depsgraph, draw::Manager* manager)
   {
-    telemetry.reset();
+    telemetry.reset_epoch();
     this->depsgraph = depsgraph;
     this->manager = manager;
     camera_orig_object = nullptr;
@@ -391,12 +466,14 @@ namespace blender::eevee
       (float(scene->r.frs_sec) / scene->r.frs_sec_base) :
       24.0f;
 
-    uniform_data.data.scene_time.frame = frame;
-    uniform_data.data.scene_time.seconds = (fps > 1e-8f) ? (frame / fps) : 0.0f;
-    uniform_data.data.scene_time.timeline = (frame_range > 1e-8f) ?
+    const float seconds = (std::abs(fps) > 1e-8f) ? (frame / fps) : 0.0f;
+
+    uniform_data.data.scene.frame = frame;
+    uniform_data.data.scene.time = seconds;
+    uniform_data.data.scene.timeline = (std::abs(frame_range) > 1e-8f) ?
       clamp_f((frame - frame_start) / frame_range, 0.0f, 1.0f) :
       0.0f;
-    uniform_data.data.scene_time._pad0 = 0.0f;
+    uniform_data.data.scene._pad0 = 0.0f;
   }
 
   /** \} */
@@ -411,41 +488,54 @@ namespace blender::eevee
 
   void Instance::begin_sync()
   {
+    update_eval_members();
     telemetry.maybe_begin_viewport_frame();
     ScopedTelemetrySample telemetry_sample(telemetry, TelemetryStageId::SyncBegin);
     /* Needs to be first for sun light parameters.
      * Also not skipped to be able to request world shader.
      * If engine shaders are not ready, will skip the pipeline sync. */
-    world.sync();
+    {
+      ScopedTelemetrySample phase(telemetry, TelemetryStageId::SyncBeginWorld);
+      world.sync();
+    }
 
     if (skip_render_)
     {
       return;
     }
 
-    materials.begin_sync();
-    velocity.begin_sync(); /* NOTE: Also syncs camera. */
-    lights.begin_sync();
-    shadows.begin_sync();
-    volume.begin_sync();
-    pipelines.begin_sync();
-    cryptomatte.begin_sync();
-    sphere_probes.begin_sync();
-    light_probes.begin_sync();
+    {
+      ScopedTelemetrySample phase(telemetry, TelemetryStageId::SyncBeginSceneModules);
+      materials.begin_sync();
+      velocity.begin_sync(); /* NOTE: Also syncs camera. */
+      lights.begin_sync();
+      shadows.begin_sync();
+      volume.begin_sync();
+      pipelines.begin_sync();
+      cryptomatte.begin_sync();
+      sphere_probes.begin_sync();
+      light_probes.begin_sync();
+    }
 
-    depth_of_field.sync();
-    raytracing.sync();
-    motion_blur.sync();
-    hiz_buffer.sync();
-    main_view.sync();
-    film.sync();
-    render_textures.begin_sync();
-    filter_materials.begin_sync();
+    {
+      ScopedTelemetrySample phase(telemetry, TelemetryStageId::SyncBeginViewEffects);
+      depth_of_field.sync();
+      raytracing.sync();
+      motion_blur.sync();
+      hiz_buffer.sync();
+      main_view.sync();
+      film.sync();
+    }
 
-    outline.begin_sync();
-    ambient_occlusion.sync();
-    volume_probes.sync();
-    lookdev.sync();
+    {
+      ScopedTelemetrySample phase(telemetry, TelemetryStageId::SyncBeginNPRPost);
+      render_textures.begin_sync();
+      filter_materials.begin_sync();
+      outline.begin_sync();
+      ambient_occlusion.sync();
+      volume_probes.sync();
+      lookdev.sync();
+    }
 
     use_surfaces = (view_layer->layflag & SCE_LAY_SOLID) != 0;
     use_curves = (view_layer->layflag & SCE_LAY_STRAND) != 0;
@@ -467,72 +557,58 @@ namespace blender::eevee
   void Instance::object_sync(ObjectRef& ob_ref, Manager& /*manager*/)
   {
     ScopedTelemetrySample telemetry_sample(telemetry, TelemetryStageId::SyncObjects);
-    if (skip_render_)
-    {
+    if (skip_render_) {
       return;
     }
 
-    Object* ob = ob_ref.object;
+    Object *ob = ob_ref.object;
     const bool is_renderable_type = ELEM(ob->type,
-      OB_CURVES,
-      OB_GREASE_PENCIL,
-      OB_MESH,
-      OB_POINTCLOUD,
-      OB_VOLUME,
-      OB_LAMP,
-      OB_LIGHTPROBE);
+                                         OB_CURVES,
+                                         OB_GREASE_PENCIL,
+                                         OB_MESH,
+                                         OB_POINTCLOUD,
+                                         OB_VOLUME,
+                                         OB_LAMP,
+                                         OB_LIGHTPROBE);
     const int ob_visibility = DRW_object_visibility_in_active_context(ob);
     const bool partsys_is_visible = (ob_visibility & OB_VISIBLE_PARTICLES) != 0 &&
-      (ob->type == OB_MESH);
+                                    (ob->type == OB_MESH);
     const bool object_is_visible = DRW_object_is_renderable(ob) &&
-      (ob_visibility & OB_VISIBLE_SELF) != 0;
+                                   (ob_visibility & OB_VISIBLE_SELF) != 0;
 
-    if (!is_renderable_type || (!partsys_is_visible && !object_is_visible))
-    {
+    if (!is_renderable_type || (!partsys_is_visible && !object_is_visible)) {
       return;
     }
 
-    ObjectHandle& ob_handle = sync.sync_object(ob_ref);
-
-    if (partsys_is_visible && ob != draw_ctx->object_edit)
-    {
-      auto sync_hair =
-        [&](ObjectHandle hair_handle, ModifierData& md, ParticleSystem& particle_sys)
-        {
-          ResourceHandleRange _res_handle = manager->resource_handle_for_psys(
-            ob_ref, ob->object_to_world());
-          sync.sync_curves(ob, hair_handle, ob_ref, _res_handle, &md, &particle_sys);
-        };
-      foreach_hair_particle_handle(*this, ob_ref, ob_handle, sync_hair);
+    if (partsys_is_visible && ob != draw_ctx->object_edit) {
+      auto sync_hair = [&](const HairParticleInfo &info) { sync.sync_curves(ob_ref, &info); };
+      foreach_hair_particle(*this, ob_ref, sync_hair);
     }
 
-    if (object_is_visible)
-    {
-      switch (ob->type)
-      {
-      case OB_LAMP:
-        lights.sync_light(ob, ob_handle);
-        break;
-      case OB_MESH:
-        if (!sync.sync_sculpt(ob, ob_handle, ob_ref))
-        {
-          sync.sync_mesh(ob, ob_handle, ob_ref);
-        }
-        break;
-      case OB_POINTCLOUD:
-        sync.sync_pointcloud(ob, ob_handle, ob_ref);
-        break;
-      case OB_VOLUME:
-        sync.sync_volume(ob, ob_handle, ob_ref);
-        break;
-      case OB_CURVES:
-        sync.sync_curves(ob, ob_handle, ob_ref);
-        break;
-      case OB_LIGHTPROBE:
-        light_probes.sync_probe(ob, ob_handle);
-        break;
-      default:
-        break;
+    if (object_is_visible) {
+      switch (ob->type) {
+        case OB_LAMP:
+          lights.sync_light(ob_ref);
+          break;
+        case OB_MESH:
+          if (!sync.sync_sculpt(ob_ref)) {
+            sync.sync_mesh(ob_ref);
+          }
+          break;
+        case OB_POINTCLOUD:
+          sync.sync_pointcloud(ob_ref);
+          break;
+        case OB_VOLUME:
+          sync.sync_volume(ob_ref);
+          break;
+        case OB_CURVES:
+          sync.sync_curves(ob_ref);
+          break;
+        case OB_LIGHTPROBE:
+          light_probes.sync_probe(ob_ref);
+          break;
+        default:
+          break;
       }
     }
   }
@@ -547,63 +623,83 @@ namespace blender::eevee
       return;
     }
 
-    bool use_sss = pipelines.deferred.closure_bits_get() & CLOSURE_SSS;
-    bool use_volume = volume.will_enable();
-
-    ShaderGroups request_bits = NONE;
-    SET_FLAG_FROM_TEST(request_bits, use_sss, SUBSURFACE_SHADERS);
-    SET_FLAG_FROM_TEST(request_bits, use_volume, VOLUME_EVAL_SHADERS);
-    loaded_shaders |= shaders.static_shaders_load_async(request_bits);
-    needed_shaders |= request_bits;
-
-    if (is_image_render)
     {
-      loaded_shaders |= shaders.static_shaders_wait_ready(request_bits);
-    }
+      ScopedTelemetrySample phase(telemetry, TelemetryStageId::SyncEndShaderReadiness);
+      bool use_sss = pipelines.deferred.closure_bits_get() & CLOSURE_SSS;
+      bool use_volume = volume.will_enable();
 
-    materials.end_sync();
-    velocity.end_sync();
-    volume.end_sync();  /* Needs to be before shadows. */
-    shadows.end_sync(); /* Needs to be before lights. */
-    lights.end_sync();
+      ShaderGroups request_bits = NONE;
+      SET_FLAG_FROM_TEST(request_bits, use_sss, SUBSURFACE_SHADERS);
+      SET_FLAG_FROM_TEST(request_bits, use_volume, VOLUME_EVAL_SHADERS);
+      loaded_shaders |= shaders.static_shaders_load_async(request_bits);
+      needed_shaders |= request_bits;
 
-    const bool viewport_soft_shadow_transform =
-        is_viewport() && is_transforming &&
-        (scene->eevee.flag & SCE_EEVEE_SHADOW_ENABLED) &&
-        (scene->eevee.flag & SCE_EEVEE_SHADOW_JITTERED_VIEWPORT);
-    discard_viewport_history_ = is_viewport() &&
-                                (depsgraph_last_update_ != DEG_get_update_count(depsgraph) ||
-                                 shadows.viewport_history_invalidated() ||
-                                 viewport_soft_shadow_transform);
-    if (is_viewport())
-    {
-      const bool uses_scene_time = materials.has_time_dependent_materials() ||
-        world.uses_scene_time() || filter_materials.uses_scene_time() ||
-        lights.has_time_dependent_light_shaders();
-      const float scene_time = uniform_data.data.scene_time.frame;
-      const bool scene_time_changed = uses_scene_time && last_viewport_scene_time_valid_ &&
-        std::abs(scene_time - last_viewport_scene_time_) > 1e-8f;
-      if (scene_time_changed)
+      if (is_image_render)
       {
-        sampling.reset();
-        discard_viewport_history_ = true;
+        loaded_shaders |= shaders.static_shaders_wait_ready(request_bits);
       }
-      last_viewport_scene_time_ = scene_time;
-      last_viewport_scene_time_valid_ = true;
     }
 
-    sampling.end_sync();
-    subsurface.end_sync();
-    film.end_sync();
-    cryptomatte.end_sync();
-    pipelines.end_sync();
-    outline.sync();
-    render_textures.end_sync();
-    filter_materials.end_sync();
-    light_probes.end_sync();
-    sphere_probes.end_sync();
-    planar_probes.end_sync();
-    uniform_data.push_update();
+    {
+      ScopedTelemetrySample phase(telemetry, TelemetryStageId::SyncEndMaterialsVelocity);
+      materials.end_sync();
+      velocity.end_sync();
+    }
+
+    {
+      ScopedTelemetrySample phase(telemetry, TelemetryStageId::SyncEndVolumeShadowsLights);
+      volume.end_sync();  /* Needs to be before shadows. */
+      shadows.end_sync(); /* Needs to be before lights. */
+      lights.end_sync();
+    }
+
+    {
+      ScopedTelemetrySample phase(telemetry, TelemetryStageId::SyncEndFrameState);
+      const bool viewport_soft_shadow_transform =
+          is_viewport() && is_transforming &&
+          (scene->eevee.flag & SCE_EEVEE_SHADOW_ENABLED) &&
+          (scene->eevee.flag & SCE_EEVEE_SHADOW_JITTERED_VIEWPORT);
+      discard_viewport_history_ = is_viewport() &&
+                                  (shadows.viewport_history_invalidated() ||
+                                   viewport_soft_shadow_transform);
+      if (is_viewport())
+      {
+        const bool uses_scene_time = materials.has_time_dependent_materials() ||
+          world.uses_scene_time() || filter_materials.uses_scene_time() ||
+          lights.has_time_dependent_light_shaders();
+        const float scene_time = uniform_data.data.scene.frame;
+        const bool scene_time_changed = uses_scene_time && last_viewport_scene_time_valid_ &&
+          std::abs(scene_time - last_viewport_scene_time_) > 1e-8f;
+        if (scene_time_changed)
+        {
+          sampling.reset();
+          discard_viewport_history_ = true;
+        }
+        last_viewport_scene_time_ = scene_time;
+        last_viewport_scene_time_valid_ = true;
+      }
+
+      sampling.end_sync();
+      subsurface.end_sync();
+      film.end_sync();
+      cryptomatte.end_sync();
+      pipelines.end_sync();
+      outline.sync();
+    }
+
+    {
+      ScopedTelemetrySample phase(telemetry, TelemetryStageId::SyncEndNPRPost);
+      render_textures.end_sync();
+      filter_materials.end_sync();
+    }
+
+    {
+      ScopedTelemetrySample phase(telemetry, TelemetryStageId::SyncEndProbesUniforms);
+      light_probes.end_sync();
+      sphere_probes.end_sync();
+      planar_probes.end_sync();
+      uniform_data.push_update();
+    }
 
     depsgraph_last_update_ = DEG_get_update_count(depsgraph);
   }
@@ -625,6 +721,20 @@ namespace blender::eevee
     end_sync();
 
     manager->end_sync();
+  }
+
+  void Instance::wait_for_material_passes()
+  {
+    const int64_t queued_shaders = materials.queued_shaders_count;
+    const int64_t queued_textures = materials.queued_textures_count;
+    const bool record_wait = telemetry.enabled() && telemetry.frame_active();
+    const double wait_start_time = record_wait ? BLI_time_now_seconds() : 0.0;
+    GPU_pass_cache_wait_for_all();
+    if (record_wait) {
+      telemetry.shader_wait_add(queued_shaders,
+                                queued_textures,
+                                BLI_time_now_seconds() - wait_start_time);
+    }
   }
 
   bool Instance::needs_lightprobe_sphere_passes() const
@@ -659,10 +769,8 @@ namespace blender::eevee
   {
     if (sampling.finished_viewport())
     {
-      /* Keep the last meaningful viewport timing once accumulation has converged.
-       * Past this point Eevee only re-displays the cached film result, so publishing the
-       * partially recorded sync-only frame would overwrite useful profiler data with zeros. */
-      telemetry.cancel_frame();
+      /* The Draw Manager still performed a complete sync before this cached-film display. Keep
+       * that sync-only capture so a converged redraw cannot hide a long synchronization spike. */
       DRW_submission_start();
       film.display();
       lookdev.display();
@@ -676,7 +784,7 @@ namespace blender::eevee
       render_sync();
       while (materials.queued_shaders_count > 0 || materials.queued_textures_count > 0)
       {
-        GPU_pass_cache_wait_for_all();
+        wait_for_material_passes();
         /** WORKAROUND: Re-sync now that all shaders are compiled. */
         /* This may need to happen more than once, since actual materials may require more passes
          * (eg. volume ones) than the fallback material used for queued passes. */
@@ -693,6 +801,8 @@ namespace blender::eevee
       DRW_submission_start();
 
       sampling.step();
+      film.update_sample_table();
+      uniform_data.push_update();
 
       capture_view.render_world();
       lookdev.rotate_world();
@@ -714,7 +824,23 @@ namespace blender::eevee
   void Instance::render_read_result(RenderLayer* render_layer, const char* view_name)
   {
     ScopedTelemetrySample telemetry_sample(telemetry, TelemetryStageId::ReadResult);
-    eViewLayerEEVEEPassType pass_bits = film.enabled_passes_get();
+    eViewLayerEEVEEPassType pass_bits = film.render_buffer_passes_get();
+    const bool record_readbacks = telemetry.enabled() && telemetry.frame_active();
+
+    const auto record_readback = [&](const TelemetryPassReadbackType type,
+                                     const char *name,
+                                     const RenderPass *rp,
+                                     const double readback_start_time) {
+      if (!record_readbacks || rp == nullptr) {
+        return;
+      }
+      telemetry.pass_readback_add(type,
+                                  name,
+                                  rp->rectx,
+                                  rp->recty,
+                                  rp->channels,
+                                  BLI_time_now_seconds() - readback_start_time);
+    };
 
     for (auto i : IndexRange(EEVEE_RENDER_PASS_MAX_BIT + 1))
     {
@@ -733,10 +859,15 @@ namespace blender::eevee
         {
           continue;
         }
+        const double readback_start_time = record_readbacks ? BLI_time_now_seconds() : 0.0;
         float* result = film.read_pass(pass_type, pass_offset);
 
         if (result)
         {
+          record_readback(TelemetryPassReadbackType::RenderPass,
+                          pass_names[pass_offset].c_str(),
+                          rp,
+                          readback_start_time);
           BLI_mutex_lock(&render->update_render_passes_mutex);
           /* WORKAROUND: We use texture read to avoid using a frame-buffer to get the render result.
            * However, on some implementation, we need a buffer with a few extra bytes for the read to
@@ -760,10 +891,12 @@ namespace blender::eevee
       {
         continue;
       }
+      const double readback_start_time = record_readbacks ? BLI_time_now_seconds() : 0.0;
       float* result = film.read_aov(&aov);
 
       if (result)
       {
+        record_readback(TelemetryPassReadbackType::AOV, aov.name, rp, readback_start_time);
         BLI_mutex_lock(&render->update_render_passes_mutex);
         /* WORKAROUND: We use texture read to avoid using a frame-buffer to get the render result.
          * However, on some implementation, we need a buffer with a few extra bytes for the read to
@@ -788,10 +921,13 @@ namespace blender::eevee
       {
         continue;
       }
+      const double readback_start_time = record_readbacks ? BLI_time_now_seconds() : 0.0;
       float* result = film.read_native_postfx_output(&output);
 
       if (result)
       {
+        record_readback(
+            TelemetryPassReadbackType::NativePostFX, output.name, rp, readback_start_time);
         BLI_mutex_lock(&render->update_render_passes_mutex);
         RE_pass_set_buffer_data(rp, result);
         BLI_mutex_unlock(&render->update_render_passes_mutex);
@@ -808,7 +944,7 @@ namespace blender::eevee
           render_layer, vector_pass_name.c_str(), view_name);
         if (vector_rp)
         {
-          memset(vector_rp->ibuf->float_buffer.data,
+          memset(vector_rp->ibuf->float_data_for_write(),
             0,
             sizeof(float) * 4 * vector_rp->rectx * vector_rp->recty);
         }
@@ -824,6 +960,8 @@ namespace blender::eevee
 
   void Instance::render_frame(RenderEngine* engine, RenderLayer* render_layer, const char* view_name)
   {
+    telemetry.render_run_id_set(engine ? engine->render_run_id : 0);
+    telemetry.render_view_name_set(view_name);
     telemetry.maybe_begin_final_frame();
     skip_render_ = skip_render_ || !is_loaded(needed_shaders);
 
@@ -908,9 +1046,8 @@ namespace blender::eevee
   {
     if (skip_render_ || !is_loaded(needed_shaders))
     {
-      telemetry.maybe_end_viewport_frame();
       DefaultFramebufferList* dfbl = draw_ctx->viewport_framebuffer_list_get();
-      GPU_framebuffer_clear_color_depth(dfbl->default_fb, float4(0.0f), 1.0f);
+      GPU_framebuffer_clear_color_depth(dfbl->default_fb, double4(0.0), 1.0f);
       if (!is_loaded(needed_shaders & ~WORLD_SHADERS))
       {
         info_append_i18n("Compiling EEVEE engine shaders");
@@ -929,7 +1066,6 @@ namespace blender::eevee
 
     render_sample();
     velocity.step_swap();
-    telemetry.maybe_end_viewport_frame();
 
     if (is_viewport_compositor_enabled)
     {
@@ -972,40 +1108,11 @@ namespace blender::eevee
     }
     else if (telemetry.enabled())
     {
-      const bke::SceneEeveePerformanceRuntime* perf_runtime =
-        (scene != nullptr && scene->runtime != nullptr) ? &scene->runtime->eevee_performance :
-        nullptr;
-      const bool viewport_paused = scene != nullptr &&
-        scene->eevee.performance_profiler_viewport_pause != 0;
-      if (scene != nullptr &&
-        (scene->eevee.flag & SCE_EEVEE_PERFORMANCE_PROFILER_STAGE_LIST) != 0)
-      {
-        const std::string report = (viewport_paused && perf_runtime != nullptr &&
-          !perf_runtime->viewport_report.empty()) ?
-          perf_runtime->viewport_report :
-          telemetry.viewport_report();
-        if (!report.empty())
-        {
-          std::stringstream stream(report);
-          std::string line;
-          while (std::getline(stream, line))
-          {
-            if (!line.empty())
-            {
-              info_append("{}", line);
-            }
-          }
-        }
-      }
-      else
-      {
-        const std::string summary = (viewport_paused && perf_runtime != nullptr &&
-          !perf_runtime->viewport_summary.empty()) ?
-          perf_runtime->viewport_summary :
-          telemetry.viewport_summary_line();
-        if (!summary.empty())
-        {
-          info_append("{}", summary);
+      const bool include_stage_list = scene != nullptr &&
+        (scene->eevee.flag & SCE_EEVEE_PERFORMANCE_PROFILER_STAGE_LIST) != 0;
+      for (const std::string& line : telemetry.viewport_overlay_lines(include_stage_list)) {
+        if (!line.empty()) {
+          info_append("{}", line);
         }
       }
     }
@@ -1015,7 +1122,6 @@ namespace blender::eevee
   {
     if (skip_render_)
     {
-      telemetry.maybe_end_viewport_frame();
       return;
     }
 
@@ -1025,7 +1131,6 @@ namespace blender::eevee
       this->render_sample();
     } while (!sampling.finished_viewport());
     velocity.step_swap();
-    telemetry.maybe_end_viewport_frame();
 
     if (is_viewport_compositor_enabled)
     {
@@ -1189,7 +1294,7 @@ namespace blender::eevee
         this->render_sync();
         while ((materials.queued_shaders_count > 0) || (materials.queued_textures_count > 0))
         {
-          GPU_pass_cache_wait_for_all();
+          wait_for_material_passes();
           /** WORKAROUND: Re-sync now that all shaders are compiled. */
           /* This may need to happen more than once, since actual materials may require more passes
            * (eg. volume ones) than the fallback material used for queued passes. */
@@ -1251,7 +1356,7 @@ namespace blender::eevee
           /* Batch ray cast. Avoids too much overhead of the context switch. */
           int sample_count_in_batch = ceilf(time_budget_ms / max(0.1f, time_per_sample_ms_smooth));
           /* Avoid batching too many rays, keep system responsive in case of bad values. */
-          sample_count_in_batch = min_iii(32, sample_count_in_batch, remaining_samples);
+          sample_count_in_batch = std::min({32, sample_count_in_batch, remaining_samples});
 
           CLOG_INFO(&Instance::log, "IrradianceBake: Casting %d rays.", sample_count_in_batch);
 

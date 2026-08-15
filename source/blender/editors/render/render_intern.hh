@@ -35,6 +35,7 @@ void RENDER_OT_npr_new(wmOperatorType *ot);
 
 void MATERIAL_OT_copy(wmOperatorType *ot);
 void MATERIAL_OT_paste(wmOperatorType *ot);
+void MATERIAL_OT_recompile_shader(wmOperatorType *ot);
 
 void SCENE_OT_view_layer_add(wmOperatorType *ot);
 void SCENE_OT_view_layer_remove(wmOperatorType *ot);
@@ -74,6 +75,11 @@ void SCENE_OT_freestyle_stroke_material_create(wmOperatorType *ot);
 void TEXTURE_OT_slot_copy(wmOperatorType *ot);
 void TEXTURE_OT_slot_paste(wmOperatorType *ot);
 void TEXTURE_OT_slot_move(wmOperatorType *ot);
+
+/* `render_texture_cache.cc` */
+
+void RENDER_OT_generate_texture_cache(wmOperatorType *ot);
+void RENDER_OT_clear_texture_cache(wmOperatorType *ot);
 
 /* `render_internal.cc` */
 

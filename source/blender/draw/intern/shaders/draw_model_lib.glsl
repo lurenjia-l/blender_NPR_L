@@ -12,6 +12,8 @@
 #  error Missing draw_modelmat additional create info on shader create info
 #endif
 
+#define DRW_MODEL_LIB_FUNCTIONS_DEFINED
+
 #if defined(GPU_VERTEX_SHADER)
 VERTEX_SHADER_CREATE_INFO(draw_resource_id_varying)
 #elif defined(GPU_FRAGMENT_SHADER)
@@ -24,14 +26,14 @@ uint drw_resource_id_raw()
 {
 #if defined(GPU_VERTEX_SHADER)
 #  ifdef WITH_CUSTOM_IDS
-  uint id = resource_id_buf[gpu_BaseInstance + gl_InstanceID].x;
+  uint id = res_id_with_custom_id_buf[gpu_BaseInstance + gl_InstanceID].x;
 #  else
-  uint id = resource_id_buf[gpu_BaseInstance + gl_InstanceID];
+  uint id = res_id_buf[gpu_BaseInstance + gl_InstanceID];
 #  endif
   return id;
 
 #elif (defined(GPU_FRAGMENT_SHADER) || defined(GPU_LIBRARY_SHADER)) && defined(RESOURCE_ID_VARYING)
-  return drw_ResourceID_iface.resource_index;
+  return drw_ResourceID_iface.resource_id;
 #endif
   return 0;
 }
@@ -46,7 +48,7 @@ uint drw_custom_id()
 #ifdef WITH_CUSTOM_IDS
 #  if defined(GPU_VERTEX_SHADER)
   uint inst_id = gpu_BaseInstance + gl_InstanceID;
-  return resource_id_buf[gpu_BaseInstance + gl_InstanceID].y;
+  return res_id_with_custom_id_buf[gpu_BaseInstance + gl_InstanceID].y;
 #  endif
 #endif
   return 0;
@@ -54,11 +56,13 @@ uint drw_custom_id()
 
 float4x4 drw_modelmat()
 {
-  return drw_matrix_buf[drw_resource_id()].model;
+  const auto &matrix_buf = buffer_get(draw_modelmat_common, drw_matrix_buf);
+  return matrix_buf[drw_resource_id()].model;
 }
 float4x4 drw_modelinv()
 {
-  return drw_matrix_buf[drw_resource_id()].model_inverse;
+  const auto &matrix_buf = buffer_get(draw_modelmat_common, drw_matrix_buf);
+  return matrix_buf[drw_resource_id()].model_inverse;
 }
 
 /**

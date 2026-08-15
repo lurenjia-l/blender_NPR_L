@@ -40,6 +40,7 @@ void ED_operatortypes_render()
 
   WM_operatortype_append(MATERIAL_OT_copy);
   WM_operatortype_append(MATERIAL_OT_paste);
+  WM_operatortype_append(MATERIAL_OT_recompile_shader);
 
   WM_operatortype_append(SCENE_OT_view_layer_add);
   WM_operatortype_append(SCENE_OT_view_layer_remove);
@@ -76,6 +77,11 @@ void ED_operatortypes_render()
   WM_operatortype_append(TEXTURE_OT_slot_copy);
   WM_operatortype_append(TEXTURE_OT_slot_paste);
   WM_operatortype_append(TEXTURE_OT_slot_move);
+
+#ifdef WITH_CYCLES
+  WM_operatortype_append(RENDER_OT_generate_texture_cache);
+  WM_operatortype_append(RENDER_OT_clear_texture_cache);
+#endif
 
   /* `render_internal.cc` */
   WM_operatortype_append(RENDER_OT_view_show);

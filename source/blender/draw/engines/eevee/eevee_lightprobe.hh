@@ -22,6 +22,7 @@
 #include "eevee_defines.hh"
 #include "eevee_lightprobe_shared.hh"
 #include "eevee_sync.hh"
+#include "eevee_telemetry.hh"
 
 namespace blender::eevee {
 
@@ -54,14 +55,14 @@ struct SphereProbeAtlasCoord {
     return SPHERE_PROBE_ATLAS_RES >> (subdivision_lvl + mip_lvl);
   }
 
-  /* Coordinate of the area in [0..area_count_per_dimension[ range. */
+  /* Coordinate of the area in [0..area_count_per_dimension) range. */
   int2 area_location() const
   {
     const int area_count_per_dimension = 1 << subdivision_lvl;
     return int2(area_index % area_count_per_dimension, area_index / area_count_per_dimension);
   }
 
-  /* Coordinate of the bottom left corner of the area in [0..SPHERE_PROBE_ATLAS_RES[ range. */
+  /* Coordinate of the bottom left corner of the area in [0..SPHERE_PROBE_ATLAS_RES) range. */
   int2 area_offset(int mip_lvl = 0) const
   {
     return area_location() * area_extent(mip_lvl);
@@ -228,6 +229,7 @@ class LightProbeModule {
   bool auto_bake_enabled_;
 
   eLightProbeResolution sphere_object_resolution_ = LIGHT_PROBE_RESOLUTION_128;
+  Vector<TelemetryProbeCost> probe_costs_;
 
  public:
   LightProbeModule(Instance &inst);
@@ -236,7 +238,7 @@ class LightProbeModule {
   void init();
 
   void begin_sync();
-  void sync_probe(const Object *ob, ObjectHandle &handle);
+  void sync_probe(const ObjectRef &ob_ref);
   void sync_world(const blender::World *world, bool has_update);
   void end_sync();
 
@@ -245,10 +247,38 @@ class LightProbeModule {
     return int(volume_map_.size() + sphere_map_.size() + planar_map_.size());
   }
 
+  int volume_probe_count() const
+  {
+    return int(volume_map_.size());
+  }
+
+  int sphere_probe_count() const
+  {
+    return int(sphere_map_.size());
+  }
+
+  int planar_probe_count() const
+  {
+    return int(planar_map_.size());
+  }
+
+  void probe_costs_reset();
+  void probe_cost_accumulate(const char *name,
+                             const char *type,
+                             int updated,
+                             int total,
+                             int rendered_views,
+                             int resolution,
+                             double estimated_work);
+  Span<const TelemetryProbeCost> probe_costs() const
+  {
+    return Span<const TelemetryProbeCost>(probe_costs_.data(), probe_costs_.size());
+  }
+
  private:
-  void sync_sphere(const Object *ob, ObjectHandle &handle);
-  void sync_volume(const Object *ob, ObjectHandle &handle);
-  void sync_planar(const Object *ob, ObjectHandle &handle);
+  void sync_sphere(const ObjectRef &ob_ref);
+  void sync_volume(const ObjectRef &ob_ref);
+  void sync_planar(const ObjectRef &ob_ref);
 
   /** Get the number of atlas layers needed to store light probe spheres. */
   int sphere_layer_count() const;

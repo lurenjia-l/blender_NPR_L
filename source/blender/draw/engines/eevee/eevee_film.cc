@@ -76,19 +76,24 @@ void Film::init_aovs(const Set<std::string> &passes_used_by_viewport_compositor)
       }
     }
 
-    /* NPR trees can sample arbitrary AOVs in the rendered viewport, but this requirement is not
-     * known yet when Film is initialized. Keep viewport AOV textures available so AOV Input works
-     * the same way as final render. */
-    const bool request_all_viewport_aovs = true || inst_.filter_materials.uses_aov();
+    /* Material NPR trees can sample AOVs in the rendered viewport, but regular material
+     * dependencies are only known after Film::sync() has initialized the render buffers.
+     * Keep all view-layer AOVs available here so viewport AOV Input matches final render.
+     * Filter graph usage is still tracked by name, but it is not the only viewport AOV user. */
+    const bool request_all_viewport_aovs = true;
+    const bool request_filter_aovs = inst_.filter_materials.uses_aov();
 
-    if (request_all_viewport_aovs || inst_.is_viewport_compositor_enabled) {
+    if (request_all_viewport_aovs || request_filter_aovs || inst_.is_viewport_compositor_enabled)
+    {
       for (ViewLayerAOV &aov : inst_.view_layer->aovs) {
         /* Already added as a display pass. No need to add again. */
         if (!aovs.is_empty() && aovs.last() == &aov) {
           continue;
         }
 
-        if (request_all_viewport_aovs || passes_used_by_viewport_compositor.contains(aov.name)) {
+        if (request_all_viewport_aovs || inst_.filter_materials.uses_aov_name(aov.name) ||
+            passes_used_by_viewport_compositor.contains(aov.name))
+        {
           aovs.append(&aov);
         }
       }
@@ -432,15 +437,16 @@ void Film::init(const int2 &extent, const rcti *output_rect)
 
   {
     /* Enable passes that need to be rendered. */
+    eViewLayerEEVEEPassType needed_passes = eViewLayerEEVEEPassType(0);
     if (inst_.is_viewport()) {
       /* Viewport Case. */
       const eViewLayerEEVEEPassType selected_pass = eViewLayerEEVEEPassType(
           inst_.v3d->shading.render_pass);
       const eViewLayerEEVEEPassType scene_enabled_passes = enabled_passes(inst_.view_layer);
-      eViewLayerEEVEEPassType enabled_passes = viewport_compositor_enabled_passes_;
+      needed_passes = viewport_compositor_enabled_passes_;
 
       if (selected_pass == EEVEE_RENDER_PASS_STENCIL_VALUE) {
-        enabled_passes |= EEVEE_RENDER_PASS_COMBINED;
+        needed_passes |= EEVEE_RENDER_PASS_COMBINED;
       }
       else if (!ELEM(selected_pass,
                      EEVEE_RENDER_PASS_CRYPTOMATTE_OBJECT,
@@ -448,46 +454,63 @@ void Film::init(const int2 &extent, const rcti *output_rect)
                      EEVEE_RENDER_PASS_CRYPTOMATTE_MATERIAL) ||
                (scene_enabled_passes & selected_pass))
       {
-        enabled_passes |= selected_pass;
+        needed_passes |= selected_pass;
       }
 
       if (inst_.overlays_enabled() || inst_.gpencil_engine_enabled()) {
         /* Overlays and Grease Pencil needs the depth for correct compositing.
          * Using the render pass ensure we store the center depth. */
-        enabled_passes |= EEVEE_RENDER_PASS_DEPTH;
-      }
-
-      if (assign_if_different(enabled_passes_, enabled_passes)) {
-        inst_.sampling.reset();
+        needed_passes |= EEVEE_RENDER_PASS_DEPTH;
       }
     }
     else {
       /* Render Case. */
-      enabled_passes_ = enabled_passes(inst_.view_layer);
+      needed_passes = enabled_passes(inst_.view_layer);
     }
 
     if (inst_.filter_materials.uses_scene_normal()) {
-      enabled_passes_ |= EEVEE_RENDER_PASS_NORMAL;
+      needed_passes |= EEVEE_RENDER_PASS_NORMAL;
+    }
+    if (inst_.filter_materials.uses_scene_depth()) {
+      needed_passes |= EEVEE_RENDER_PASS_DEPTH;
     }
     if (inst_.filter_materials.uses_scene_position()) {
-      enabled_passes_ |= EEVEE_RENDER_PASS_POSITION;
+      needed_passes |= EEVEE_RENDER_PASS_POSITION;
     }
     if (inst_.filter_materials.uses_cryptomatte_object() &&
         (inst_.view_layer->cryptomatte_flag & VIEW_LAYER_CRYPTOMATTE_OBJECT))
     {
-      enabled_passes_ |= EEVEE_RENDER_PASS_CRYPTOMATTE_OBJECT;
+      needed_passes |= EEVEE_RENDER_PASS_CRYPTOMATTE_OBJECT;
+    }
+
+    /* Force enable color passes if light passes are enabled.
+     * This is needed since we need to pre-divide by them. */
+    if (enabled_passes_ & EEVEE_RENDER_PASS_DIFFUSE_LIGHT) {
+      enabled_passes_ |= EEVEE_RENDER_PASS_DIFFUSE_COLOR;
+    }
+    if (enabled_passes_ & EEVEE_RENDER_PASS_SPECULAR_LIGHT) {
+      enabled_passes_ |= EEVEE_RENDER_PASS_SPECULAR_COLOR;
     }
 
     /* Filter obsolete passes. */
-    enabled_passes_ &= ~(EEVEE_RENDER_PASS_UNUSED_8 | EEVEE_RENDER_PASS_UNUSED_14);
+    needed_passes &= ~(EEVEE_RENDER_PASS_UNUSED_8 | EEVEE_RENDER_PASS_UNUSED_14);
 
     if (!scene.eevee.use_outline) {
-      enabled_passes_ &= ~EEVEE_RENDER_PASS_OUTLINE;
+      needed_passes &= ~EEVEE_RENDER_PASS_OUTLINE;
     }
 
     if (scene.r.mode & R_MBLUR) {
       /* Disable motion vector pass if motion blur is enabled. */
-      enabled_passes_ &= ~EEVEE_RENDER_PASS_VECTOR;
+      needed_passes &= ~EEVEE_RENDER_PASS_VECTOR;
+    }
+
+    if (inst_.is_viewport()) {
+      if (assign_if_different(enabled_passes_, needed_passes)) {
+        inst_.sampling.reset();
+      }
+    }
+    else {
+      enabled_passes_ = needed_passes;
     }
   }
   {
@@ -553,11 +576,11 @@ void Film::init(const int2 &extent, const rcti *output_rect)
                                                 EEVEE_RENDER_PASS_POSITION |
                                                 EEVEE_RENDER_PASS_VECTOR;
     const eViewLayerEEVEEPassType color_passes_1 = EEVEE_RENDER_PASS_DIFFUSE_LIGHT |
+                                                   EEVEE_RENDER_PASS_DIFFUSE_COLOR |
                                                    EEVEE_RENDER_PASS_SPECULAR_LIGHT |
-                                                   EEVEE_RENDER_PASS_VOLUME_LIGHT |
-                                                   EEVEE_RENDER_PASS_EMIT;
-    const eViewLayerEEVEEPassType color_passes_2 = EEVEE_RENDER_PASS_DIFFUSE_COLOR |
-                                                   EEVEE_RENDER_PASS_SPECULAR_COLOR |
+                                                   EEVEE_RENDER_PASS_SPECULAR_COLOR;
+    const eViewLayerEEVEEPassType color_passes_2 = EEVEE_RENDER_PASS_VOLUME_LIGHT |
+                                                   EEVEE_RENDER_PASS_EMIT |
                                                    EEVEE_RENDER_PASS_ENVIRONMENT |
                                                    EEVEE_RENDER_PASS_MIST |
                                                    EEVEE_RENDER_PASS_SHADOW | EEVEE_RENDER_PASS_AO;
@@ -750,6 +773,7 @@ void Film::sync()
     accumulate_ps_.dispatch(int3(math::divide_ceil(data_.extent, int2(FILM_GROUP_SIZE)), 1));
   }
   else {
+    accumulate_ps_.push_constant("display_only", &display_only_);
     accumulate_ps_.draw_procedural(GPU_PRIM_TRIS, 1, 3);
   }
 
@@ -858,9 +882,26 @@ void Film::end_sync()
 
 float2 Film::pixel_jitter_get() const
 {
+  const bool has_time_dependent_shading = inst_.materials.has_time_dependent_materials() ||
+                                          inst_.world.uses_scene_time() ||
+                                          inst_.filter_materials.uses_scene_time() ||
+                                          inst_.lights.has_time_dependent_light_shaders();
+  if (inst_.is_viewport() &&
+      (inst_.discard_viewport_history() || has_time_dependent_shading) &&
+      inst_.sampling.interactive_mode() &&
+      !inst_.sampling.use_custom_pixel_jitter_sample())
+  {
+    /* Without reprojection history, sub-pixel jitter is exposed as whole-image motion. Keep the
+     * jitter deterministic for time-dependent shading too: an extra redraw of the same timeline
+     * frame can temporarily re-enable history while playback is still invalidating it. */
+    return float2(0.0f);
+  }
+
   float2 jitter = inst_.sampling.rng_2d_get(SAMPLING_FILTER_U);
 
-  if (!use_box_filter && data_.filter_radius < M_SQRT1_2 && !inst_.camera.is_panoramic()) {
+  if (!use_box_filter && data_.filter_radius < M_SQRT1_2 && !inst_.camera.is_panoramic() &&
+      !inst_.sampling.use_custom_pixel_jitter_sample())
+  {
     /* For filter size less than a pixel, change sampling strategy and use a uniform disk
      * distribution covering the filter shape. This avoids putting samples in areas without any
      * weights. */
@@ -1052,13 +1093,10 @@ void Film::accumulate(View &view,
     GPU_framebuffer_bind(dfbl->default_fb);
     /* Clear when using render borders. */
     if (data_.extent != int2(GPU_texture_width(dtxl->color), GPU_texture_height(dtxl->color))) {
-      float4 clear_color = {0.0f, 0.0f, 0.0f, 0.0f};
-      GPU_framebuffer_clear_color(dfbl->default_fb, clear_color);
+      GPU_framebuffer_clear_color(dfbl->default_fb, double4(0.0));
     }
     GPU_framebuffer_viewport_set(dfbl->default_fb, UNPACK2(data_.offset), UNPACK2(data_.extent));
   }
-
-  update_sample_table();
 
   combined_final_tx_ = combined_final_tx;
   history_display_tx_ = combined_tx_.current();
@@ -1068,9 +1106,7 @@ void Film::accumulate(View &view,
                                                               dummy_outline_tx_.gpu_texture();
   has_outline_input_ = outline_input_tx != nullptr;
   use_outline_in_combined_ = outline_combined_tx != nullptr;
-  data_.display_only = false;
-  inst_.uniform_data.push_update();
-
+  display_only_ = false;
   inst_.manager->submit(accumulate_ps_, view);
   inst_.manager->submit(copy_ps_, view);
 
@@ -1103,11 +1139,9 @@ void Film::display()
   has_outline_input_ = inst_.outline.has_result();
   use_outline_in_combined_ = has_outline_input_ && inst_.outline.use_in_combined();
 
-  data_.display_only = true;
-  inst_.uniform_data.push_update();
-
   draw::View &drw_view = draw::View::default_get();
 
+  display_only_ = true;
   DRW_manager_get()->submit(accumulate_ps_, drw_view);
 
   inst_.render_buffers.release();
@@ -1228,7 +1262,7 @@ void Film::write_viewport_compositor_passes()
        * all cases for now. */
       const char *pass_name = pass_names[pass_offset].c_str();
       draw::TextureFromPool &output_pass_texture = DRW_viewport_pass_texture_get(pass_name);
-      output_pass_texture.acquire(this->display_extent, GPU_texture_format(pass_texture));
+      output_pass_texture.acquire_2d(this->display_extent, GPU_texture_format(pass_texture));
 
       PassSimple write_pass_ps = {"Film.WriteViewportCompositorPass"};
       const eShaderType write_shader_type = get_write_pass_shader_type(pass_type);
@@ -1254,7 +1288,7 @@ void Film::write_viewport_compositor_passes()
 
     /* See above comment regarding the allocation extent. */
     draw::TextureFromPool &output_pass_texture = DRW_viewport_pass_texture_get(aov.name);
-    output_pass_texture.acquire(this->display_extent, GPU_texture_format(pass_texture));
+    output_pass_texture.acquire_2d(this->display_extent, GPU_texture_format(pass_texture));
 
     PassSimple write_pass_ps = {"Film.WriteViewportCompositorPass"};
     const eShaderType write_shader_type = get_aov_write_pass_shader_type(&aov);
@@ -1281,7 +1315,7 @@ void Film::write_viewport_compositor_passes()
     }
 
     draw::TextureFromPool &output_pass_texture = DRW_viewport_pass_texture_get(output.name);
-    output_pass_texture.acquire(this->display_extent, GPU_texture_format(pass_texture));
+    output_pass_texture.acquire_2d(this->display_extent, GPU_texture_format(pass_texture));
 
     PassSimple write_pass_ps = {"Film.WriteViewportCompositorNativePostFXPass"};
     const ePassStorageType storage_type = NativePostFXOutputModule::output_storage_type(

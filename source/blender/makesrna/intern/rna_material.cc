@@ -7,10 +7,12 @@
  */
 
 #include <cfloat>
+#include <climits>
 #include <cstdlib>
 
 #include "DNA_material_types.h"
 #include "DNA_mesh_types.h"
+#include "DNA_node_types.h"
 #include "DNA_scene_types.h"
 
 #include "BLI_math_rotation.h"
@@ -18,6 +20,8 @@
 #include "BLT_translation.hh"
 
 #include "BKE_customdata.hh"
+#include "BKE_node_legacy_types.hh"
+#include "BKE_node_tree_update.hh"
 
 #include "RNA_define.hh"
 #include "RNA_enum_types.hh"
@@ -54,6 +58,21 @@ const EnumPropertyItem rna_enum_ramp_blend_items[] = {
     {MA_RAMP_SAT, "SATURATION", 0, "Saturation", ""},
     {MA_RAMP_COLOR, "COLOR", 0, "Color", ""},
     {MA_RAMP_VAL, "VALUE", 0, "Value", ""},
+    {0, nullptr, 0, nullptr, nullptr},
+};
+
+enum {
+  MA_SHADER_COMPILE_NOT_COMPILED = 0,
+  MA_SHADER_COMPILE_QUEUED = 1,
+  MA_SHADER_COMPILE_COMPILED = 2,
+  MA_SHADER_COMPILE_FAILED = 3,
+};
+
+const EnumPropertyItem rna_enum_material_shader_compile_status_items[] = {
+    {MA_SHADER_COMPILE_NOT_COMPILED, "NOT_COMPILED", 0, "Not Compiled", ""},
+    {MA_SHADER_COMPILE_QUEUED, "QUEUED", 0, "Queued", ""},
+    {MA_SHADER_COMPILE_COMPILED, "COMPILED", 0, "Compiled", ""},
+    {MA_SHADER_COMPILE_FAILED, "FAILED", 0, "Failed", ""},
     {0, nullptr, 0, nullptr, nullptr},
 };
 
@@ -97,6 +116,8 @@ const EnumPropertyItem rna_enum_ramp_blend_items[] = {
 #  include "ED_image.hh"
 #  include "ED_node.hh"
 #  include "ED_screen.hh"
+
+#  include "GPU_material.hh"
 
 namespace blender {
 
@@ -154,6 +175,79 @@ static void rna_Material_draw_update(Main * /*bmain*/, Scene * /*scene*/, Pointe
   WM_main_add_notifier(NC_MATERIAL | ND_SHADING_DRAW, ma);
 }
 
+static GPUMaterial *rna_Material_latest_compiled_gpu_material(Material *ma)
+{
+  GPUMaterial *latest_gpumat = nullptr;
+  uint64_t latest_timestamp = 0;
+
+  for (LinkData &link : ma->gpumaterial) {
+    GPUMaterial *gpumat = static_cast<GPUMaterial *>(link.data);
+    if (gpumat == nullptr || GPU_material_status(gpumat) != GPU_MAT_SUCCESS) {
+      continue;
+    }
+
+    const uint64_t timestamp = GPU_material_compilation_timestamp(gpumat);
+    if (timestamp >= latest_timestamp) {
+      latest_timestamp = timestamp;
+      latest_gpumat = gpumat;
+    }
+  }
+
+  return latest_gpumat;
+}
+
+static int rna_Material_shader_compile_status_get(PointerRNA *ptr)
+{
+  Material *ma = id_cast<Material *>(ptr->owner_id);
+  bool has_compiled = false;
+  bool has_failed = false;
+
+  for (LinkData &link : ma->gpumaterial) {
+    GPUMaterial *gpumat = static_cast<GPUMaterial *>(link.data);
+    if (gpumat == nullptr) {
+      continue;
+    }
+
+    switch (GPU_material_status(gpumat)) {
+      case GPU_MAT_QUEUED:
+        return MA_SHADER_COMPILE_QUEUED;
+      case GPU_MAT_SUCCESS:
+        has_compiled = true;
+        break;
+      case GPU_MAT_FAILED:
+        has_failed = true;
+        break;
+    }
+  }
+
+  if (has_failed) {
+    return MA_SHADER_COMPILE_FAILED;
+  }
+  if (has_compiled) {
+    return MA_SHADER_COMPILE_COMPILED;
+  }
+  return MA_SHADER_COMPILE_NOT_COMPILED;
+}
+
+static float rna_Material_shader_compile_time_get(PointerRNA *ptr)
+{
+  Material *ma = id_cast<Material *>(ptr->owner_id);
+  GPUMaterial *gpumat = rna_Material_latest_compiled_gpu_material(ma);
+  return gpumat ? float(GPU_material_compilation_time(gpumat)) : 0.0f;
+}
+
+static int rna_Material_shader_compile_timestamp_get(PointerRNA *ptr)
+{
+  Material *ma = id_cast<Material *>(ptr->owner_id);
+  GPUMaterial *gpumat = rna_Material_latest_compiled_gpu_material(ma);
+  if (gpumat == nullptr) {
+    return 0;
+  }
+
+  const uint64_t timestamp = GPU_material_compilation_timestamp(gpumat);
+  return timestamp > uint64_t(INT_MAX) ? INT_MAX : int(timestamp);
+}
+
 static void rna_Material_eevee_domain_update(Main *bmain, Scene * /*scene*/, PointerRNA *ptr)
 {
   Material *ma = id_cast<Material *>(ptr->owner_id);
@@ -170,20 +264,23 @@ static void rna_Material_eevee_domain_update(Main *bmain, Scene * /*scene*/, Poi
        scene = static_cast<Scene *>(scene->id.next))
   {
     bool changed = false;
-    for (SceneFilterMaterial *filter_entry = static_cast<SceneFilterMaterial *>(
-             scene->eevee.filter_materials.first);
-         filter_entry != nullptr;
-         filter_entry = static_cast<SceneFilterMaterial *>(filter_entry->next))
-    {
-      if (filter_entry->material != ma) {
-        continue;
+    bNodeTree *filter_graph = scene->eevee.filter_graph;
+    if (filter_graph != nullptr && filter_graph->type == NTREE_EEVEE_FILTER_GRAPH) {
+      for (bNode *node = static_cast<bNode *>(filter_graph->nodes.first); node != nullptr;
+           node = node->next)
+      {
+        if (node->type_legacy != EEVEE_FILTER_GRAPH_NODE_FILTER_MATERIAL || node->id != &ma->id) {
+          continue;
+        }
+        id_us_min(&ma->id);
+        node->id = nullptr;
+        BKE_ntree_update_tag_node_property(filter_graph, node);
+        changed = true;
       }
-      id_us_min(&ma->id);
-      filter_entry->material = nullptr;
-      changed = true;
     }
     if (changed) {
       DEG_id_tag_update(&scene->id, ID_RECALC_SYNC_TO_EVAL);
+      WM_main_add_notifier(NC_SCENE | ND_NODES, scene);
       WM_main_add_notifier(NC_SCENE | ND_RENDER_OPTIONS, scene);
     }
   }
@@ -285,7 +382,7 @@ static void rna_Material_blend_method_set(PointerRNA *ptr, int new_blend_method)
 static void rna_Material_render_method_set(PointerRNA *ptr, int new_render_method)
 {
   Material *material = id_cast<Material *>(ptr->owner_id);
-  material->surface_render_method = new_render_method;
+  material->surface_render_method = eMaterial_SurfaceRenderMethod(new_render_method);
 
   /* Still sets the legacy property for forward compatibility. */
   switch (new_render_method) {
@@ -641,15 +738,35 @@ static void rna_def_material_greasepencil(BlenderRNA *brna)
       {0, nullptr, 0, nullptr, nullptr},
   };
 
+  static EnumPropertyItem placement_mode_items[] = {
+      {GP_MATERIAL_PLACEMENT_COUNT,
+       "COUNT",
+       0,
+       "Count",
+       "Place dots evenly along each segment of the stroke"},
+      {GP_MATERIAL_PLACEMENT_RADIUS,
+       "RADIUS",
+       0,
+       "Radius",
+       "Place dots evenly with respect to radius"},
+      {GP_MATERIAL_PLACEMENT_DENSITY,
+       "DENSITY",
+       0,
+       "Density",
+       "Place dots evenly along the length of the stroke"},
+      {0, nullptr, 0, nullptr, nullptr},
+  };
+
   srna = RNA_def_struct(brna, "MaterialGPencilStyle", nullptr);
   RNA_def_struct_sdna(srna, "MaterialGPencilStyle");
   RNA_def_struct_ui_text(srna, "Grease Pencil Color", "");
   RNA_def_struct_path_func(srna, "rna_GpencilColorData_path");
 
   prop = RNA_def_property(srna, "color", PROP_FLOAT, PROP_COLOR);
-  RNA_def_property_range(prop, 0.0, 1.0);
   RNA_def_property_float_sdna(prop, nullptr, "stroke_rgba");
   RNA_def_property_array(prop, 4);
+  RNA_def_property_range(prop, 0.0f, FLT_MAX);
+  RNA_def_property_ui_range(prop, 0.0f, 1.0f, 0.1f, 3);
   RNA_def_property_ui_text(prop, "Color", "");
   RNA_def_property_update(prop, NC_GPENCIL | ND_SHADING, "rna_MaterialGpencil_update");
 
@@ -657,7 +774,8 @@ static void rna_def_material_greasepencil(BlenderRNA *brna)
   prop = RNA_def_property(srna, "fill_color", PROP_FLOAT, PROP_COLOR);
   RNA_def_property_float_sdna(prop, nullptr, "fill_rgba");
   RNA_def_property_array(prop, 4);
-  RNA_def_property_range(prop, 0.0f, 1.0f);
+  RNA_def_property_range(prop, 0.0f, FLT_MAX);
+  RNA_def_property_ui_range(prop, 0.0f, 1.0f, 0.1f, 3);
   RNA_def_property_ui_text(prop, "Fill Color", "Color for filling region bounded by each stroke");
   RNA_def_property_update(prop, NC_GPENCIL | ND_SHADING, "rna_MaterialGpencil_update");
 
@@ -665,7 +783,8 @@ static void rna_def_material_greasepencil(BlenderRNA *brna)
   prop = RNA_def_property(srna, "mix_color", PROP_FLOAT, PROP_COLOR);
   RNA_def_property_float_sdna(prop, nullptr, "mix_rgba");
   RNA_def_property_array(prop, 4);
-  RNA_def_property_range(prop, 0.0f, 1.0f);
+  RNA_def_property_range(prop, 0.0f, FLT_MAX);
+  RNA_def_property_ui_range(prop, 0.0f, 1.0f, 0.1f, 3);
   RNA_def_property_ui_text(prop, "Mix Color", "Color for mixing with primary filling color");
   RNA_def_property_update(prop, NC_GPENCIL | ND_SHADING, "rna_MaterialGpencil_update");
 
@@ -789,10 +908,105 @@ static void rna_def_material_greasepencil(BlenderRNA *brna)
   RNA_def_property_float_default(prop, 0.0f);
   RNA_def_property_range(prop, -DEG2RADF(90.0f), DEG2RADF(90.0f));
   RNA_def_property_ui_range(prop, -DEG2RADF(90.0f), DEG2RADF(90.0f), 10, 3);
-  RNA_def_property_ui_text(prop,
-                           "Rotation",
-                           "Additional rotation applied to dots and square texture of strokes. "
-                           "Only applies in texture shading mode.");
+  RNA_def_property_ui_text(
+      prop, "Rotation", "Additional rotation applied to dots and square texture of strokes");
+  RNA_def_property_update(prop, NC_GPENCIL | ND_SHADING, "rna_MaterialGpencil_update");
+
+  /* Placement mode for Dots and Squares. */
+  prop = RNA_def_property(srna, "placement_mode", PROP_ENUM, PROP_NONE);
+  RNA_def_property_enum_bitflag_sdna(prop, nullptr, "placement_mode");
+  RNA_def_property_enum_items(prop, placement_mode_items);
+  RNA_def_property_enum_default(prop, GP_MATERIAL_PLACEMENT_RADIUS);
+  RNA_def_property_ui_text(
+      prop, "Placement", "Defines how Dots or Squares are placed along strokes");
+  RNA_def_property_update(prop, NC_GPENCIL | ND_SHADING, "rna_MaterialGpencil_update");
+
+  /* Placement count. */
+  prop = RNA_def_property(srna, "placement_count", PROP_INT, PROP_NONE);
+  RNA_def_property_int_sdna(prop, nullptr, "placement_count");
+  RNA_def_property_range(prop, 1, INT_MAX);
+  RNA_def_property_ui_text(prop, "Count", "Number of dots placed per segment");
+  RNA_def_property_update(prop, NC_GPENCIL | ND_SHADING, "rna_MaterialGpencil_update");
+
+  /* Placement radius factor. */
+  prop = RNA_def_property(srna, "placement_radius_spacing", PROP_FLOAT, PROP_PERCENTAGE);
+  RNA_def_property_float_sdna(prop, nullptr, "placement_radius_spacing");
+  RNA_def_property_float_default(prop, 100.0f);
+  RNA_def_property_range(prop, 0.0f, FLT_MAX);
+  RNA_def_property_ui_range(prop, 1.0f, 200.0f, 10, 0);
+  RNA_def_property_ui_text(
+      prop, "Spacing", "Spacing between dots as a percentage of the diameter");
+  RNA_def_property_update(prop, NC_GPENCIL | ND_SHADING, "rna_MaterialGpencil_update");
+
+  /* Placement density. */
+  prop = RNA_def_property(srna, "placement_density", PROP_FLOAT, PROP_NONE);
+  RNA_def_property_float_sdna(prop, nullptr, "placement_density");
+  RNA_def_property_float_default(prop, 10.0f);
+  RNA_def_property_range(prop, 0.0f, FLT_MAX);
+  RNA_def_property_ui_text(prop, "Density", "Density of dots along the stroke");
+  RNA_def_property_update(prop, NC_GPENCIL | ND_SHADING, "rna_MaterialGpencil_update");
+
+  /* Use Randomization. */
+  prop = RNA_def_property(srna, "use_randomization", PROP_BOOLEAN, PROP_NONE);
+  RNA_def_property_boolean_sdna(prop, nullptr, "flag", GP_MATERIAL_USE_DOTS_RANDOMIZATION);
+  RNA_def_property_ui_text(prop, "Randomization", "Use material randomization");
+  RNA_def_property_update(prop, NC_GPENCIL | ND_SHADING, "rna_MaterialGpencil_update");
+
+  /* Random Size. */
+  prop = RNA_def_property(srna, "random_size_factor", PROP_FLOAT, PROP_NONE);
+  RNA_def_property_float_sdna(prop, nullptr, "random_size_factor");
+  RNA_def_property_float_default(prop, 0.0f);
+  RNA_def_property_range(prop, 0.0f, 1.0f);
+  RNA_def_property_ui_text(prop, "Size", "Randomize the size");
+  RNA_def_property_update(prop, NC_GPENCIL | ND_SHADING, "rna_MaterialGpencil_update");
+
+  /* Random Strength. */
+  prop = RNA_def_property(srna, "random_strength_factor", PROP_FLOAT, PROP_NONE);
+  RNA_def_property_float_sdna(prop, nullptr, "random_strength_factor");
+  RNA_def_property_float_default(prop, 0.0f);
+  RNA_def_property_range(prop, 0.0f, 1.0f);
+  RNA_def_property_ui_text(prop, "Strength", "Randomize strength");
+  RNA_def_property_update(prop, NC_GPENCIL | ND_SHADING, "rna_MaterialGpencil_update");
+
+  /* Random Rotation. */
+  prop = RNA_def_property(srna, "random_rotation_factor", PROP_FLOAT, PROP_NONE);
+  RNA_def_property_float_sdna(prop, nullptr, "random_rotation_factor");
+  RNA_def_property_float_default(prop, 0.0f);
+  RNA_def_property_range(prop, 0.0f, 1.0f);
+  RNA_def_property_ui_text(prop, "Rotation", "Randomize texture rotation");
+  RNA_def_property_update(prop, NC_GPENCIL | ND_SHADING, "rna_MaterialGpencil_update");
+
+  /* Random Color Hue. */
+  prop = RNA_def_property(srna, "random_hue_factor", PROP_FLOAT, PROP_NONE);
+  RNA_def_property_float_sdna(prop, nullptr, "random_hue_factor");
+  RNA_def_property_float_default(prop, 0.0f);
+  RNA_def_property_range(prop, 0.0f, 1.0f);
+  RNA_def_property_ui_text(prop, "Hue", "Randomize color hue");
+  RNA_def_property_update(prop, NC_GPENCIL | ND_SHADING, "rna_MaterialGpencil_update");
+
+  /* Random Color Saturation. */
+  prop = RNA_def_property(srna, "random_saturation_factor", PROP_FLOAT, PROP_NONE);
+  RNA_def_property_float_sdna(prop, nullptr, "random_saturation_factor");
+  RNA_def_property_float_default(prop, 0.0f);
+  RNA_def_property_range(prop, 0.0f, 1.0f);
+  RNA_def_property_ui_text(prop, "Saturation", "Randomize color saturation");
+  RNA_def_property_update(prop, NC_GPENCIL | ND_SHADING, "rna_MaterialGpencil_update");
+
+  /* Random Color Value. */
+  prop = RNA_def_property(srna, "random_value_factor", PROP_FLOAT, PROP_NONE);
+  RNA_def_property_float_sdna(prop, nullptr, "random_value_factor");
+  RNA_def_property_float_default(prop, 0.0f);
+  RNA_def_property_range(prop, 0.0f, 1.0f);
+  RNA_def_property_ui_text(prop, "Value", "Randomize color value");
+  RNA_def_property_update(prop, NC_GPENCIL | ND_SHADING, "rna_MaterialGpencil_update");
+
+  /* Random Noise Scale. */
+  prop = RNA_def_property(srna, "random_noise_scale", PROP_FLOAT, PROP_NONE);
+  RNA_def_property_float_sdna(prop, nullptr, "random_noise_scale");
+  RNA_def_property_float_default(prop, 1.0f);
+  RNA_def_property_range(prop, 0.0f, FLT_MAX);
+  RNA_def_property_ui_range(prop, 0.0f, 2.0f, 0.1f, 3);
+  RNA_def_property_ui_text(prop, "Noise Scale", "Scale the noise frequency");
   RNA_def_property_update(prop, NC_GPENCIL | ND_SHADING, "rna_MaterialGpencil_update");
 
   /* pass index for future compositing and editing tools */
@@ -1445,6 +1659,25 @@ void RNA_def_material(BlenderRNA *brna)
   RNA_def_property_ui_text(
       prop, "Pass Index", "Index number for the \"Material Index\" render pass");
   RNA_def_property_update(prop, NC_OBJECT, "rna_Material_update");
+
+  prop = RNA_def_property(srna, "shader_compile_status", PROP_ENUM, PROP_NONE);
+  RNA_def_property_enum_items(prop, rna_enum_material_shader_compile_status_items);
+  RNA_def_property_enum_funcs(prop, "rna_Material_shader_compile_status_get", nullptr, nullptr);
+  RNA_def_property_clear_flag(prop, PROP_EDITABLE);
+  RNA_def_property_ui_text(prop, "Shader Compile Status", "Current GPU shader compilation status");
+
+  prop = RNA_def_property(srna, "shader_compile_time", PROP_FLOAT, PROP_TIME_ABSOLUTE);
+  RNA_def_property_float_funcs(prop, "rna_Material_shader_compile_time_get", nullptr, nullptr);
+  RNA_def_property_clear_flag(prop, PROP_EDITABLE);
+  RNA_def_property_ui_range(prop, 0.0f, FLT_MAX, 0.001f, 3);
+  RNA_def_property_ui_text(
+      prop, "Shader Compile Time", "GPU shader compilation wall time in seconds");
+
+  prop = RNA_def_property(srna, "shader_compile_timestamp", PROP_INT, PROP_UNSIGNED);
+  RNA_def_property_int_funcs(prop, "rna_Material_shader_compile_timestamp_get", nullptr, nullptr);
+  RNA_def_property_clear_flag(prop, PROP_EDITABLE);
+  RNA_def_property_flag(prop, PROP_HIDDEN);
+  RNA_def_property_ui_text(prop, "Shader Compile Timestamp", "Latest GPU shader compilation count");
 
   /* nodetree */
   prop = RNA_def_property(srna, "node_tree", PROP_POINTER, PROP_NONE);

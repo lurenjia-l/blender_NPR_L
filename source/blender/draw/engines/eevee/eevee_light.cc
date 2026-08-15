@@ -85,7 +85,7 @@ static bool light_nodetree_output_input_is_default_info_link(const bNodeTree &no
                                                              const char *from_identifier,
                                                              const bNode *&r_info_node)
 {
-  const bNodeSocket *to_socket = bke::node_find_socket(output, SOCK_IN, to_identifier);
+  const bNodeSocket *to_socket = bke::node_find_socket(output, SOCK_IN, UString(to_identifier));
   if (to_socket == nullptr || (to_socket->flag & SOCK_UNAVAIL)) {
     return false;
   }
@@ -105,7 +105,7 @@ static bool light_nodetree_output_input_is_default_info_link(const bNodeTree &no
     return false;
   }
 
-  const bNodeSocket *from_socket = bke::node_find_socket(info, SOCK_OUT, from_identifier);
+  const bNodeSocket *from_socket = bke::node_find_socket(info, SOCK_OUT, UString(from_identifier));
   if (from_socket == nullptr || (from_socket->flag & SOCK_UNAVAIL) ||
       link->fromsock != from_socket)
   {
@@ -166,7 +166,7 @@ static bool light_shader_node_type_is_uniform(const int type)
   switch (type) {
     case SH_NODE_RGB:
     case SH_NODE_VALUE:
-    case SH_NODE_SCENE_TIME:
+    case GEO_NODE_INPUT_SCENE_TIME:
     case SH_NODE_BLACKBODY:
     case SH_NODE_BRIGHTCONTRAST:
     case SH_NODE_VALTORGB:
@@ -297,7 +297,8 @@ static LightShaderDependency light_nodetree_eevee_light_shader_dependency_get(
 
   LightShaderDependency result = LightShaderDependency::Uniform;
   for (const StringRefNull input_identifier : {"Color", "Intensity", "Attenuation"}) {
-    const bNodeSocket *input_socket = bke::node_find_socket(*output, SOCK_IN, input_identifier);
+    const bNodeSocket *input_socket = bke::node_find_socket(
+        *output, SOCK_IN, UString(input_identifier));
     if (input_socket == nullptr || (input_socket->flag & SOCK_UNAVAIL)) {
       return LightShaderDependency::PointDependent;
     }
@@ -309,6 +310,75 @@ static LightShaderDependency light_nodetree_eevee_light_shader_dependency_get(
     }
   }
   return result;
+}
+
+static bool light_shader_socket_uses_scene_time_get(const bNodeTree &nodetree,
+                                                    const bNodeSocket &socket,
+                                                    Set<const bNode *> &visited);
+
+static bool light_shader_node_uses_scene_time_get(const bNodeTree &nodetree,
+                                                  const bNode &node,
+                                                  Set<const bNode *> &visited)
+{
+  if (node.flag & NODE_MUTED) {
+    return false;
+  }
+  if (node.type_legacy == GEO_NODE_INPUT_SCENE_TIME) {
+    return true;
+  }
+  if (visited.contains(&node)) {
+    return false;
+  }
+  visited.add(&node);
+
+  if (node.type_legacy == NODE_REROUTE) {
+    const bNodeSocket *input_socket = static_cast<const bNodeSocket *>(node.inputs.first);
+    return input_socket && light_shader_socket_uses_scene_time_get(nodetree, *input_socket, visited);
+  }
+
+  for (const bNodeSocket *input_socket = static_cast<const bNodeSocket *>(node.inputs.first);
+       input_socket != nullptr;
+       input_socket = input_socket->next)
+  {
+    if (light_shader_socket_uses_scene_time_get(nodetree, *input_socket, visited)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool light_shader_socket_uses_scene_time_get(const bNodeTree &nodetree,
+                                                    const bNodeSocket &socket,
+                                                    Set<const bNode *> &visited)
+{
+  const bNodeLink *link = light_nodetree_link_to_input_get(nodetree, socket);
+  if (link == nullptr || (link->flag & NODE_LINK_MUTED) || (link->flag & NODE_LINK_VALID) == 0 ||
+      link->fromnode == nullptr)
+  {
+    return false;
+  }
+  return light_shader_node_uses_scene_time_get(nodetree, *link->fromnode, visited);
+}
+
+static bool light_nodetree_eevee_light_shader_uses_scene_time(const bNodeTree *nodetree)
+{
+  const bNode *output = light_nodetree_eevee_light_shader_output_get(nodetree);
+  if (nodetree == nullptr || output == nullptr || (output->flag & NODE_MUTED)) {
+    return false;
+  }
+
+  for (const StringRefNull input_identifier : {"Color", "Intensity", "Attenuation"}) {
+    const bNodeSocket *input_socket = bke::node_find_socket(
+        *output, SOCK_IN, UString(input_identifier));
+    if (input_socket == nullptr || (input_socket->flag & SOCK_UNAVAIL)) {
+      continue;
+    }
+    Set<const bNode *> visited;
+    if (light_shader_socket_uses_scene_time_get(*nodetree, *input_socket, visited)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /* Convert by putting the least significant bits in the first component. */
@@ -433,8 +503,8 @@ void Light::sync(ShadowModule &shadows,
   this->filter_radius = la->shadow_filter_radius;
   this->shadow_jitter = (la->mode & LA_SHADOW_JITTER) != 0;
   this->lightgroup_id = max_ii(lightgroup_id, 0);
-
   this->shadow_map_scale = max_ff(la->shadow_map_scale, 0.0001f);
+  this->visible_camera = (visibility_flag & OB_HIDE_CAMERA) == 0;
 
   if (la->mode & LA_SHADOW) {
     shadow_ensure(shadows);
@@ -674,7 +744,7 @@ float Light::point_radiance_get()
 
 void Light::debug_draw()
 {
-  drw_debug_sphere(transform_location(this->object_to_world),
+  drw_debug_sphere(this->object_to_world.location(),
                    this->local().local.influence_radius_max,
                    float4(0.8f, 0.3f, 0.0f, 1.0f));
 }
@@ -720,8 +790,13 @@ void LightModule::add_world_sun_light(const ObjectKey &key, bool use_diffuse, bo
   int visibility_flag = 0;
   SET_FLAG_FROM_TEST(visibility_flag, !use_diffuse, OB_HIDE_DIFFUSE);
   SET_FLAG_FROM_TEST(visibility_flag, !use_glossy, OB_HIDE_GLOSSY);
+  visibility_flag |= OB_HIDE_CAMERA;
 
   Light &light = light_map_.lookup_or_add_default(key);
+  light_names_.add_overwrite(key,
+                             use_diffuse && use_glossy ?
+                                 "World Sun" :
+                                 (use_diffuse ? "World Sun Diffuse" : "World Sun Glossy"));
   light.used = true;
   light.sync(inst_.shadows,
              float4x4::identity(),
@@ -773,7 +848,6 @@ void LightModule::begin_sync()
   light_shader_valid_ = false;
   front_light_shader_valid_ = false;
   uniform_light_shader_valid_ = false;
-  uniform_light_shader_evaluated_ = false;
   front_light_shader_missing_prepass_reported_ = false;
   front_light_shader_needed_ = false;
   has_time_dependent_light_shaders_ = false;
@@ -789,9 +863,9 @@ void LightModule::begin_sync()
   }
 }
 
-void LightModule::sync_light(const Object *ob, ObjectHandle &handle)
+void LightModule::sync_light(const ObjectRef &ob_ref)
 {
-  const blender::Light &la = DRW_object_get_data_for_drawing<const blender::Light>(*ob);
+  const blender::Light &la = DRW_object_get_data_for_drawing<const blender::Light>(*ob_ref.object);
   if (use_scene_lights_ == false) {
     return;
   }
@@ -802,19 +876,20 @@ void LightModule::sync_light(const Object *ob, ObjectHandle &handle)
     }
   }
 
-  Light &light = light_map_.lookup_or_add_default(handle.object_key);
+  Light &light = light_map_.lookup_or_add_default(ObjectKey(ob_ref));
+  light_names_.add_overwrite(ObjectKey(ob_ref), ob_ref.object->id.name + 2);
   light.used = true;
   const float light_shader_range_scale = light_nodetree_eevee_light_shader_range_scale_get(
       la.nodetree);
-  if (handle.recalc != 0 || !light.initialized ||
+  if (inst_.get_recalc_flags(ob_ref) != 0 || !light.initialized ||
       (is_local_light(light.type) && light.light_shader_range_scale != light_shader_range_scale))
   {
     light.initialized = true;
     light.sync(inst_.shadows,
-               ob->object_to_world(),
-               ob->visibility_flag,
+               ob_ref.object_to_world(),
+               ob_ref.object->visibility_flag,
                &la,
-               ob->light_linking,
+               ob_ref.light_linking(),
                light_shader_range_scale,
                light_threshold_,
                la.lightgroup_id);
@@ -822,8 +897,8 @@ void LightModule::sync_light(const Object *ob, ObjectHandle &handle)
   else if (is_sun_light(light.type)) {
     /* Directional shadow sync stores view-dependent clipmap offsets in the matrix translation.
      * Restore the source object transform before exposing it to light shader nodes this frame. */
-    light.object_to_world = light_object_to_world_normalized_get(ob->object_to_world());
-    light.sun().direction = light_z_axis(light);
+    light.object_to_world = light_object_to_world_normalized_get(ob_ref.object_to_world());
+    light.sun().direction = light.z_axis();
   }
   light.light_shader_index = -1;
   light.front_light_shader_index = -1;
@@ -843,8 +918,10 @@ void LightModule::sync_light(const Object *ob, ObjectHandle &handle)
       r_light_shader_index = materials.size();
       materials.append(gpumat);
       lights.append(static_cast<const LightData &>(light));
-      has_time_dependent_light_shaders_ |= GPU_material_is_time_dependent(gpumat);
-      inst_.manager->register_layer_attributes(gpumat);
+      const bool is_time_dependent = GPU_material_is_time_dependent(gpumat) ||
+                                     light_nodetree_eevee_light_shader_uses_scene_time(la.nodetree);
+      has_time_dependent_light_shaders_ |= is_time_dependent;
+      inst_.manager->register_material_resources(gpumat);
       return;
     }
     inst_.info_append_i18n(error_message);
@@ -875,11 +952,7 @@ void LightModule::sync_light(const Object *ob, ObjectHandle &handle)
                             "baking.");
     }
     else {
-      register_light_shader(eLightShaderPipeline::Surface,
-                            light.light_shader_index,
-                            light_shader_materials_,
-                            light_shader_lights_,
-                            "Error: Custom light shader failed to compile for surface lighting.");
+      tag_front_light_shader_needed();
       register_light_shader(eLightShaderPipeline::Front,
                             light.front_light_shader_index,
                             front_light_shader_materials_,
@@ -895,6 +968,88 @@ void LightModule::sync_light(const Object *ob, ObjectHandle &handle)
   }
   sun_lights_len_ += int(is_sun_light(light.type));
   local_lights_len_ += int(!is_sun_light(light.type));
+}
+
+static const char *light_type_name_get(const eLightType type)
+{
+  switch (type) {
+    case LIGHT_SUN:
+    case LIGHT_SUN_ORTHO:
+      return "SUN";
+    case LIGHT_RECT:
+    case LIGHT_ELLIPSE:
+      return "AREA";
+    case LIGHT_SPOT_SPHERE:
+    case LIGHT_SPOT_DISK:
+      return "SPOT";
+    case LIGHT_OMNI_SPHERE:
+    case LIGHT_OMNI_DISK:
+      return "POINT";
+  }
+  return "UNKNOWN";
+}
+
+void LightModule::update_shadow_light_costs()
+{
+  shadow_light_costs_.clear();
+  if (!inst_.telemetry.enabled()) {
+    return;
+  }
+
+  double total_score = 0.0;
+  for (const auto item : light_map_.items()) {
+    const Light &light = item.value;
+    if (light.tilemap_index == LIGHT_NO_SHADOW) {
+      continue;
+    }
+
+    const int tilemap_max = light.tilemap_max_get();
+    const int tilemaps = max_ii(0, tilemap_max - light.tilemap_index + 1);
+    if (tilemaps == 0) {
+      continue;
+    }
+
+    int sync_dirty_tilemaps = 0;
+    int estimated_views = 0;
+    for (const int tilemap_index : IndexRange(light.tilemap_index, tilemaps)) {
+      if (tilemap_index < 0 || tilemap_index >= inst_.shadows.tilemap_pool.tilemaps_data.size()) {
+        continue;
+      }
+      const ShadowTileMapData &tilemap = inst_.shadows.tilemap_pool.tilemaps_data[tilemap_index];
+      sync_dirty_tilemaps += int(tilemap.is_dirty);
+      estimated_views += 1;
+    }
+
+    TelemetryShadowLightCost cost;
+    if (const std::string *name = light_names_.lookup_ptr(item.key)) {
+      cost.name = *name;
+    }
+    else {
+      cost.name = "Light";
+    }
+    cost.type = light_type_name_get(light.type);
+    cost.tilemaps = tilemaps;
+    cost.estimated_views = estimated_views;
+    cost.sync_dirty_tilemaps = sync_dirty_tilemaps;
+    cost.estimated_share_percent = double(estimated_views);
+    shadow_light_costs_.append(cost);
+    total_score += cost.estimated_share_percent;
+  }
+
+  if (total_score > 0.0) {
+    for (TelemetryShadowLightCost &cost : shadow_light_costs_) {
+      cost.estimated_share_percent = (cost.estimated_share_percent / total_score) * 100.0;
+      cost.level = cost.estimated_share_percent >= 25.0 ? "HIGH" :
+                   cost.estimated_share_percent >= 10.0 ? "MEDIUM" :
+                                                           "LOW";
+    }
+  }
+
+  std::sort(shadow_light_costs_.begin(),
+            shadow_light_costs_.end(),
+            [](const TelemetryShadowLightCost &a, const TelemetryShadowLightCost &b) {
+              return a.estimated_share_percent > b.estimated_share_percent;
+            });
 }
 
 void LightModule::end_sync()
@@ -922,6 +1077,7 @@ void LightModule::end_sync()
     Light &light = (*it).value;
     /* Do not discard casters in baking mode. See WORKAROUND in `surfels_create`. */
     if (!light.used && !inst_.is_baking()) {
+      light_names_.remove((*it).key);
       light_map_.remove(it);
       continue;
     }
@@ -1042,7 +1198,25 @@ void LightModule::culling_extent_sync(const int2 render_extent)
 
   culling_pass_sync();
   update_pass_sync();
+  shape_display_pass_sync();
   debug_pass_sync();
+}
+
+void LightModule::shape_display_pass_sync()
+{
+  shape_display_ps_.init();
+
+  if (lights_len_ == 0) {
+    return;
+  }
+
+  shape_display_ps_.state_set(DRW_STATE_WRITE_COLOR | DRW_STATE_BLEND_ADD |
+                              DRW_STATE_CLIP_CONTROL_UNIT_RANGE | inst_.film.depth.test_state);
+  shape_display_ps_.shader_set(inst_.shaders.static_shader_get(LIGHT_SHAPE_DISPLAY));
+  shape_display_ps_.bind_resources(inst_.uniform_data);
+  shape_display_ps_.bind_resources(inst_.volume.result);
+  shape_display_ps_.bind_resources(inst_.lights);
+  shape_display_ps_.draw_procedural(GPU_PRIM_TRIS, 1, lights_len_ * 6);
 }
 
 void LightModule::culling_pass_sync()
@@ -1140,17 +1314,20 @@ void LightModule::light_shader_pass_sync(const int2 extent)
   const float white[4] = {1.0f, 1.0f, 1.0f, 1.0f};
   light_shader_valid_ = false;
   if (light_shader_materials_.is_empty()) {
+    light_shader_fbs_.clear();
     light_shader_tx_.ensure_2d_array(
         gpu::TextureFormat::SFLOAT_16_16_16_16, int2(1), 1, usage, white);
-    light_shader_fbs_.clear();
     return;
   }
 
   const int layer_len = light_shader_materials_.size();
   if (layer_len > GPU_max_texture_layers()) {
+    light_shader_fbs_.clear();
     light_shader_tx_.ensure_2d_array(
         gpu::TextureFormat::SFLOAT_16_16_16_16, int2(1), 1, usage, white);
-    light_shader_fbs_.clear();
+    light_shader_index_buf_disable_point_dependent(light_shader_src_index_buf_,
+                                                   max_ii(lights_len_, 1));
+    light_shader_src_index_buf_.push_update();
     light_shader_index_buf_disable_point_dependent(light_shader_index_buf_,
                                                    max_ii(lights_len_, 1));
     light_shader_index_buf_.push_update();
@@ -1187,17 +1364,20 @@ void LightModule::front_light_shader_pass_sync(const int2 extent)
   const float white[4] = {1.0f, 1.0f, 1.0f, 1.0f};
   front_light_shader_valid_ = false;
   if (front_light_shader_materials_.is_empty()) {
+    front_light_shader_fbs_.clear();
     front_light_shader_tx_.ensure_2d_array(
         gpu::TextureFormat::SFLOAT_16_16_16_16, int2(1), 1, usage, white);
-    front_light_shader_fbs_.clear();
     return;
   }
 
   const int layer_len = front_light_shader_materials_.size();
   if (layer_len > GPU_max_texture_layers()) {
+    front_light_shader_fbs_.clear();
     front_light_shader_tx_.ensure_2d_array(
         gpu::TextureFormat::SFLOAT_16_16_16_16, int2(1), 1, usage, white);
-    front_light_shader_fbs_.clear();
+    light_shader_index_buf_disable_point_dependent(front_light_shader_src_index_buf_,
+                                                   max_ii(lights_len_, 1));
+    front_light_shader_src_index_buf_.push_update();
     disable_point_dependent_front_light_shader_indices();
     inst_.info_append_i18n("Error: Too many custom light shader front-layer surface layers.");
     return;
@@ -1231,7 +1411,6 @@ void LightModule::front_light_shader_pass_sync(const int2 extent)
 void LightModule::uniform_light_shader_pass_sync()
 {
   uniform_light_shader_valid_ = false;
-  uniform_light_shader_evaluated_ = false;
   const int result_len = max_ii(uniform_light_shader_materials_.size(), 1);
   uniform_light_shader_buf_.resize(result_len);
   uniform_light_shader_buf_.clear_to_zero();
@@ -1272,6 +1451,9 @@ void LightModule::volume_light_shader_pass_sync(const int3 grid_size)
   const int layer_len = volume_light_shader_materials_.size() * max_ii(grid_size.z, 1);
   if (layer_len > GPU_max_texture_layers()) {
     volume_light_shader_tx_.free();
+    light_shader_index_buf_disable_point_dependent(volume_light_shader_src_index_buf_,
+                                                   max_ii(lights_len_, 1));
+    volume_light_shader_src_index_buf_.push_update();
     light_shader_index_buf_disable_point_dependent(volume_light_shader_index_buf_,
                                                    max_ii(lights_len_, 1));
     volume_light_shader_index_buf_.push_update();
@@ -1299,6 +1481,9 @@ void LightModule::surfel_light_shader_pass_sync(uint surfel_len)
   if (surfel_light_shader_materials_.is_empty() || surfel_len == 0) {
     surfel_light_shader_buf_.resize(1);
     surfel_light_shader_buf_.clear_to_zero();
+    light_shader_index_buf_disable_point_dependent(surfel_light_shader_src_index_buf_,
+                                                   max_ii(lights_len_, 1));
+    surfel_light_shader_src_index_buf_.push_update();
     light_shader_index_buf_disable_point_dependent(surfel_light_shader_index_buf_,
                                                    max_ii(lights_len_, 1));
     surfel_light_shader_index_buf_.push_update();
@@ -1322,6 +1507,9 @@ void LightModule::surfel_light_shader_pass_sync(uint surfel_len)
   if (result_len > uint64_t(std::numeric_limits<int64_t>::max()) || required_mem > max_size) {
     surfel_light_shader_buf_.resize(1);
     surfel_light_shader_buf_.clear_to_zero();
+    light_shader_index_buf_disable_point_dependent(surfel_light_shader_src_index_buf_,
+                                                   max_ii(lights_len_, 1));
+    surfel_light_shader_src_index_buf_.push_update();
     light_shader_index_buf_disable_point_dependent(surfel_light_shader_index_buf_,
                                                    max_ii(lights_len_, 1));
     surfel_light_shader_index_buf_.push_update();
@@ -1364,11 +1552,15 @@ void LightModule::eval_light_shaders(View &view, const int2 extent)
     pass.material_set(*inst_.manager, light_shader_materials_[layer]);
     pass.push_constant("light_index", layer);
     pass.bind_resources(inst_.uniform_data);
-    pass.bind_resources(inst_.gbuffer);
+    pass.bind_texture(GBUF_NORMAL_TEX_SLOT, &inst_.gbuffer.normal_tx);
+    pass.bind_texture(GBUF_HEADER_TEX_SLOT, &inst_.gbuffer.header_tx);
+    pass.bind_texture(GBUF_CLOSURE_TEX_SLOT, &inst_.gbuffer.closure_tx);
     pass.bind_resources(inst_.hiz_buffer.front);
     pass.bind_resources(inst_.lights);
+    pass.bind_resources(inst_.shadows);
     pass.bind_texture(RBUFS_UTILITY_TEX_SLOT, inst_.pipelines.utility_tx);
     pass.bind_ssbo(LIGHT_BUF_SLOT, &light_shader_light_buf_);
+    pass.barrier(GPU_BARRIER_FRAMEBUFFER | GPU_BARRIER_TEXTURE_FETCH);
     pass.draw_procedural(GPU_PRIM_TRIS, 1, 3);
     inst_.manager->submit(pass, view);
   }
@@ -1391,9 +1583,9 @@ void LightModule::eval_front_light_shaders(View &view, const int2 extent)
                                        GPU_TEXTURE_USAGE_SHADER_READ;
     const float white[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     front_light_shader_valid_ = false;
+    front_light_shader_fbs_.clear();
     front_light_shader_tx_.ensure_2d_array(
         gpu::TextureFormat::SFLOAT_16_16_16_16, int2(1), 1, usage, white);
-    front_light_shader_fbs_.clear();
     disable_point_dependent_front_light_shader_indices();
     if (!front_light_shader_missing_prepass_reported_) {
       inst_.info_append_i18n(
@@ -1420,6 +1612,7 @@ void LightModule::eval_front_light_shaders(View &view, const int2 extent)
     pass.bind_resources(inst_.uniform_data);
     pass.bind_resources(inst_.hiz_buffer.front);
     pass.bind_resources(inst_.lights);
+    pass.bind_resources(inst_.shadows);
     pass.bind_texture(RBUFS_UTILITY_TEX_SLOT, inst_.pipelines.utility_tx);
     pass.bind_texture(PREPASS_NORMAL_TEX_SLOT, &inst_.render_buffers.prepass_normal_tx);
     pass.bind_ssbo(LIGHT_BUF_SLOT, &front_light_shader_light_buf_);
@@ -1453,6 +1646,7 @@ void LightModule::eval_bake_light_shaders(View &view,
     pass.push_constant("light_index", layer);
     pass.bind_resources(inst_.uniform_data);
     pass.bind_resources(inst_.lights);
+    pass.bind_resources(inst_.shadows);
     pass.bind_texture(RBUFS_UTILITY_TEX_SLOT, inst_.pipelines.utility_tx);
     pass.bind_texture("bake_light_shader_position_tx", &position_tx);
     pass.bind_texture("bake_light_shader_normal_tx", &normal_tx);
@@ -1469,24 +1663,24 @@ void LightModule::eval_uniform_light_shaders(View &view)
     return;
   }
 
-  if (uniform_light_shader_evaluated_) {
-    return;
-  }
-
+  /* Keep the point-independent light-shader path spatially cheap, but do not cache the GPU result
+   * across render/view submissions. Scene-time and other pass resources can change without a full
+   * light re-sync, and stale uniform-light results are worse than this tiny compute pass. */
   for (const int layer : uniform_light_shader_materials_.index_range()) {
     PassSimple pass = {"UniformLightShader.Pass"};
     pass.material_set(*inst_.manager, uniform_light_shader_materials_[layer]);
     pass.push_constant("light_index", layer);
     pass.bind_resources(inst_.uniform_data);
     pass.bind_resources(inst_.lights);
+    pass.bind_resources(inst_.shadows);
     pass.bind_texture(RBUFS_UTILITY_TEX_SLOT, inst_.pipelines.utility_tx);
     pass.bind_ssbo(LIGHT_BUF_SLOT, &uniform_light_shader_light_buf_);
     pass.bind_ssbo(LIGHT_SHADER_UNIFORM_BUF_SLOT, &uniform_light_shader_buf_);
     pass.dispatch(int3(1, 1, 1));
+    pass.barrier(GPU_BARRIER_SHADER_STORAGE);
     inst_.manager->submit(pass, view);
   }
   GPU_memory_barrier(GPU_BARRIER_SHADER_STORAGE);
-  uniform_light_shader_evaluated_ = true;
 }
 
 void LightModule::sync_volume_light_shaders(const int3 grid_size)
@@ -1512,6 +1706,7 @@ void LightModule::eval_volume_light_shaders(View &view, const int3 grid_size)
     pass.bind_resources(inst_.uniform_data);
     pass.bind_resources(inst_.sampling);
     pass.bind_resources(inst_.lights);
+    pass.bind_resources(inst_.shadows);
     pass.bind_texture(RBUFS_UTILITY_TEX_SLOT, inst_.pipelines.utility_tx);
     pass.bind_ssbo(LIGHT_BUF_SLOT, &volume_light_shader_light_buf_);
     pass.bind_image("out_light_shader_img", &volume_light_shader_tx_);
@@ -1537,6 +1732,7 @@ void LightModule::eval_surfel_light_shaders(View &view,
     pass.push_constant("light_index", layer);
     pass.bind_resources(inst_.uniform_data);
     pass.bind_resources(inst_.lights);
+    pass.bind_resources(inst_.shadows);
     pass.bind_texture(RBUFS_UTILITY_TEX_SLOT, inst_.pipelines.utility_tx);
     pass.bind_ssbo(SURFEL_BUF_SLOT, &surfels_buf);
     pass.bind_ssbo(CAPTURE_BUF_SLOT, &capture_info_buf);
@@ -1589,7 +1785,7 @@ void LightModule::set_view(View &view, const int2 extent)
         light.object_to_world = inst_.world.sunlight[src_index].object_to_world;
 
         LightSunData sun_data = light.sun();
-        sun_data.direction = transform_z_axis(inst_.world.sunlight[src_index].object_to_world);
+        sun_data.direction = inst_.world.sunlight[src_index].object_to_world.z_axis();
         light.sun() = sun_data;
       }
       return light;
@@ -1658,6 +1854,12 @@ void LightModule::debug_draw(View &view, gpu::FrameBuffer *view_fb)
     GPU_framebuffer_bind(view_fb);
     inst_.manager->submit(debug_draw_ps_, view);
   }
+}
+
+void LightModule::shape_display_draw(View &view, gpu::FrameBuffer *view_fb)
+{
+  GPU_framebuffer_bind(view_fb);
+  inst_.manager->submit(shape_display_ps_, view);
 }
 
 /** \} */

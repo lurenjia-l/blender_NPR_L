@@ -248,15 +248,20 @@ void RenderTextureModule::slot_capture(const int slot_index)
     rbufs.prepass_normal_tx.clear(float4(0.0f));
   }
 
-  const float4 clear_color = float4(0.0f, 0.0f, 0.0f, 1.0f);
+  const double4 clear_color = double4(0.0, 0.0, 0.0, 1.0);
   GPU_framebuffer_bind(combined_fb_);
   GPU_framebuffer_clear_color_depth(combined_fb_, clear_color, inst_.film.depth.clear_value);
   inst_.pipelines.background.clear(render_view);
 
   inst_.lights.set_view(render_view, slot.extent);
   inst_.hiz_buffer.set_source(&inst_.render_buffers.depth_tx);
+  inst_.volume.set_view(main_view, slot.extent, false);
+  inst_.uniform_data.data.push_update();
 
   inst_.volume.draw_prepass(main_view);
+  inst_.pipelines.background.render(render_view, combined_fb_);
+
+  bool volume_compute_done = false;
   inst_.pipelines.deferred.render(main_view,
                                   render_view,
                                   prepass_fb_,
@@ -264,12 +269,12 @@ void RenderTextureModule::slot_capture(const int slot_index)
                                   gbuffer_fb_,
                                   slot.extent,
                                   rt_buffer_opaque_,
-                                  rt_buffer_refract_);
-  inst_.pipelines.background.render(render_view, combined_fb_);
+                                  rt_buffer_refract_,
+                                  volume_compute_done);
 
-  inst_.gbuffer.release();
-
-  inst_.volume.draw_compute(main_view, slot.extent);
+  if (!volume_compute_done) {
+    inst_.volume.draw_compute(main_view, slot.extent);
+  }
   inst_.volume.draw_resolve(main_view);
   inst_.ambient_occlusion.render_pass(render_view);
   inst_.pipelines.forward.render(
@@ -277,6 +282,7 @@ void RenderTextureModule::slot_capture(const int slot_index)
 
   slot_extract(slot_index, rbufs);
 
+  inst_.gbuffer.release();
   rbufs.release();
 
   data_[slot_index].info.w &= ~RENDER_TEXTURE_SLOT_CAPTURING;

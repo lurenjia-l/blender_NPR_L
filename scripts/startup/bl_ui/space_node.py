@@ -24,6 +24,7 @@ from bl_ui.space_toolsystem_common import (
 )
 from bl_ui.properties_material import (
     EEVEE_MATERIAL_PT_settings,
+    EEVEE_MATERIAL_PT_settings_shader_compilation,
     EEVEE_MATERIAL_PT_settings_surface,
     EEVEE_MATERIAL_PT_settings_volume,
     MATERIAL_PT_viewport,
@@ -35,14 +36,7 @@ from bl_ui.properties_data_light import (
     DATA_PT_light,
     DATA_PT_EEVEE_light,
 )
-
-
-def eevee_active_filter_material_entry(props):
-    active_index = props.active_filter_material_index
-    if active_index < 0 or active_index >= len(props.filter_materials):
-        return None
-    return props.filter_materials[active_index]
-
+from bl_operators.geometry_nodes import geometry_modifier_poll
 
 class NODE_HT_header(Header):
     bl_space_type = 'NODE_EDITOR'
@@ -115,17 +109,17 @@ class NODE_HT_header(Header):
 
             if snode.shader_type == 'FILTER':
                 NODE_MT_editor_menus.draw_collapsible(context, layout)
-                props = scene.eevee
-                filter_entry = eevee_active_filter_material_entry(props)
 
                 layout.separator_spacer()
 
-                row = layout.row(align=True)
+                row = layout.row()
                 row.enabled = not snode.pin
-                if filter_entry is None:
-                    row.operator("scene.eevee_filter_material_new", text="New Filter Material")
+                if hasattr(snode, "filter_material"):
+                    row.template_ID(snode, "filter_material", new="node.filter_material_new")
+                elif snode_id and getattr(snode_id, "eevee_domain", None) == 'FILTER':
+                    row.label(text=snode_id.name, icon='MATERIAL')
                 else:
-                    row.template_ID(filter_entry, "material", new="scene.eevee_filter_material_new")
+                    row.label(text="No Filter Material", icon='MATERIAL')
 
             if snode.shader_type == 'LINESTYLE':
                 view_layer = context.view_layer
@@ -182,20 +176,27 @@ class NODE_HT_header(Header):
                 sequencer_scene = context.workspace.sequencer_scene
                 sequencer_editor = sequencer_scene.sequence_editor if sequencer_scene else None
                 active_strip = sequencer_editor.active_strip if sequencer_editor else None
-                active_modifier = active_strip.modifiers.active if active_strip else None
-                is_compositor_modifier_active = active_modifier and active_modifier.type == 'COMPOSITOR'
-                if is_compositor_modifier_active and not snode.pin:
-                    if active_modifier.node_group:
-                        row.template_ID(active_modifier,
-                                        "node_group",
-                                        new="node.duplicate_compositing_modifier_node_group")
-                    else:
-                        row.template_ID(
-                            active_modifier,
+                if active_strip:
+                    active_modifier = active_strip.modifiers.active
+                    is_compositor_modifier_active = active_modifier and active_modifier.type == 'COMPOSITOR'
+                    is_compositor_effect_active = active_strip.type == 'COMPOSITOR'
+                    if is_compositor_effect_active and not snode.pin:
+                        row.template_ID(  # @TODO: duplicate operator
+                            active_strip,
                             "node_group",
                             new="node.new_compositor_sequencer_node_group")
-                elif active_strip and active_strip.type != 'SOUND':
-                    row.template_ID(snode, "node_tree", new="node.new_compositor_sequencer_node_group")
+                    elif is_compositor_modifier_active and not snode.pin:
+                        if active_modifier.node_group:
+                            row.template_ID(active_modifier,
+                                            "node_group",
+                                            new="node.duplicate_compositing_modifier_node_group")
+                        else:
+                            row.template_ID(
+                                active_modifier,
+                                "node_group",
+                                new="node.new_compositor_sequencer_node_group")
+                    elif active_strip.type != 'SOUND':
+                        row.template_ID(snode, "node_tree", new="node.new_compositor_sequencer_node_group")
 
         elif snode.tree_type == 'GeometryNodeTree':
             layout.prop(snode, "node_tree_sub_type", text="")
@@ -210,6 +211,8 @@ class NODE_HT_header(Header):
                     row.enabled = False
                     row.template_ID(snode, "node_tree", new="node.new_geometry_node_group_assign")
                 elif ob:
+                    row.enabled = geometry_modifier_poll(context)
+
                     active_modifier = ob.modifiers.active
                     if active_modifier and active_modifier.type == 'NODES':
                         if active_modifier.node_group:
@@ -226,12 +229,16 @@ class NODE_HT_header(Header):
                     layout.popover(panel="NODE_PT_geometry_node_tool_options", text="Options")
                 display_pin = False
         else:
-            # Custom node tree is edited as independent ID block
+            # Most custom node trees are edited as independent ID blocks.
+            # Eevee Filter Graph is scene-owned and selected through Scene.eevee.
             NODE_MT_editor_menus.draw_collapsible(context, layout)
 
             layout.separator_spacer()
 
-            layout.template_ID(snode, "node_tree", new="node.new_node_tree")
+            if snode.tree_type == 'EeveeFilterGraphNodeTree':
+                layout.template_ID(scene.eevee, "filter_graph", new="scene.eevee_filter_graph_new")
+            else:
+                layout.template_ID(snode, "node_tree", new="node.new_node_tree")
 
         # Put pin next to ID block
         if display_pin:
@@ -337,9 +344,53 @@ class NODE_MT_add(node_add_menu.AddNodeMenu):
             layout.menu_contents("NODE_MT_shader_node_add_all")
         elif snode.tree_type == 'TextureNodeTree':
             layout.menu_contents("NODE_MT_texture_node_add_all")
+        elif snode.tree_type == 'EeveeFilterGraphNodeTree':
+            layout.menu_contents("NODE_MT_filter_graph_node_add_all")
         elif nodeitems_utils.has_node_categories(context):
             # Actual node sub-menus are defined by draw functions from node categories.
             nodeitems_utils.draw_node_categories_menu(self, context)
+
+
+class NODE_MT_filter_graph_node_input(node_add_menu.AddNodeMenu):
+    bl_space_type = 'NODE_EDITOR'
+    bl_label = "Input"
+    bl_translation_context = i18n_contexts.operator_default
+
+    def draw(self, _context):
+        layout = self.layout
+        self.node_operator(layout, "EeveeFilterGraphNodeSceneColor")
+        self.node_operator(layout, "EeveeFilterGraphNodeAOVInput")
+
+
+class NODE_MT_filter_graph_node_pass(node_add_menu.AddNodeMenu):
+    bl_space_type = 'NODE_EDITOR'
+    bl_label = "Pass"
+    bl_translation_context = i18n_contexts.operator_default
+
+    def draw(self, _context):
+        layout = self.layout
+        self.node_operator(layout, "EeveeFilterGraphNodeFilterMaterial", label="Filter Pass")
+
+
+class NODE_MT_filter_graph_node_output(node_add_menu.AddNodeMenu):
+    bl_space_type = 'NODE_EDITOR'
+    bl_label = "Output"
+    bl_translation_context = i18n_contexts.operator_default
+
+    def draw(self, _context):
+        layout = self.layout
+        self.node_operator(layout, "EeveeFilterGraphNodeStageOutput")
+
+
+class NODE_MT_filter_graph_node_add_all(Menu):
+    bl_space_type = 'NODE_EDITOR'
+    bl_label = ""
+
+    def draw(self, _context):
+        layout = self.layout
+        layout.menu("NODE_MT_filter_graph_node_input")
+        layout.menu("NODE_MT_filter_graph_node_pass")
+        layout.menu("NODE_MT_filter_graph_node_output")
 
 
 class NODE_MT_swap(node_add_menu.SwapNodeMenu):
@@ -560,8 +611,9 @@ class NODE_PT_material_slots(Panel):
         if ob.mode == 'EDIT':
             row = layout.row(align=True)
             row.operator("object.material_slot_assign", text="Assign")
-            row.operator("object.material_slot_select", text="Select")
-            row.operator("object.material_slot_deselect", text="Deselect")
+            if ob.type != 'FONT':
+                row.operator("object.material_slot_select", text="Select")
+                row.operator("object.material_slot_deselect", text="Deselect")
 
 
 class NODE_PT_geometry_node_tool_object_types(Panel):
@@ -709,6 +761,7 @@ class NODE_MT_context_menu(Menu):
     def draw(self, context):
         snode = context.space_data
         is_nested = (len(snode.path) > 1)
+        parent_tree_index = len(snode.path) - 2
         is_geometrynodes = snode.tree_type == 'GeometryNodeTree'
         group = snode.edit_tree
 
@@ -738,8 +791,10 @@ class NODE_MT_context_menu(Menu):
 
             if is_nested:
                 layout.separator()
-
-                layout.operator("node.tree_path_parent", text="Exit Group", icon='FILE_PARENT')
+                layout.operator(
+                    "node.tree_path_parent",
+                    text="Exit Group",
+                    icon='FILE_PARENT').parent_tree_index = parent_tree_index
 
             return
 
@@ -780,7 +835,10 @@ class NODE_MT_context_menu(Menu):
                 layout.operator("node.group_ungroup", text="Ungroup")
 
             if is_nested:
-                layout.operator("node.tree_path_parent", text="Exit Group", icon='FILE_PARENT')
+                layout.operator(
+                    "node.tree_path_parent",
+                    text="Exit Group",
+                    icon='FILE_PARENT').parent_tree_index = parent_tree_index
 
             layout.separator()
 
@@ -844,7 +902,7 @@ class NODE_PT_active_node_generic(Panel):
         col.prop(node, "show_options")
         col.prop(node, "mute")
 
-        if tree.type == 'GEOMETRY':
+        if tree.type in ('GEOMETRY', 'COMPOSITING'):
             layout.prop(node, "warning_propagation", text="Propagate")
 
 
@@ -981,7 +1039,7 @@ class NODE_PT_overlay(Panel):
     bl_space_type = 'NODE_EDITOR'
     bl_region_type = 'HEADER'
     bl_label = "Overlays"
-    bl_ui_units_x = 7
+    bl_ui_units_x = 14
 
     def draw(self, context):
         layout = self.layout
@@ -1016,6 +1074,13 @@ class NODE_PT_overlay(Panel):
 
         if snode.tree_type == 'CompositorNodeTree':
             col.prop(overlay, "show_timing", text="Timings")
+
+            subcol = col.column(align=True)
+            subcol.active = overlay.show_render_size and snode.show_backdrop
+
+            row = subcol.row(align=True)
+            row.prop(overlay, "show_render_size", text="Render Region")
+            row.prop(overlay, "passepartout_alpha", text="Passepartout")
 
 
 class NODE_MT_node_tree_interface_context_menu(Menu):
@@ -1101,6 +1166,12 @@ class NODE_PT_node_tree_properties(Panel):
                 col = body.column(align=True)
                 col.prop(group, "is_modifier")
                 col.prop(group, "is_tool")
+        elif group.bl_idname == "CompositorNodeTree":
+            header, body = col.panel("group_usage")
+            header.label(text="Usage")
+            if body:
+                col = body.column(align=True)
+                col.prop(group, "is_strip_modifier")
 
 
 class NODE_PT_node_tree_animation(Panel):
@@ -1196,6 +1267,10 @@ class NODE_AST_compositor(bpy.types.AssetShelf):
             "Combine Spherical",
             "Separate Cylindrical",
             "Separate Spherical",
+            "3D to Screen Space",
+            "Screen to 3D Space",
+            "Project with Depth",
+            "Transform and Project",
         }
 
         compositor_essentials_path = Path(os.path.join(
@@ -1215,6 +1290,10 @@ classes = (
     NODE_HT_header,
     NODE_MT_editor_menus,
     NODE_MT_add,
+    NODE_MT_filter_graph_node_input,
+    NODE_MT_filter_graph_node_pass,
+    NODE_MT_filter_graph_node_output,
+    NODE_MT_filter_graph_node_add_all,
     NODE_MT_swap,
     NODE_MT_select,
     NODE_MT_node,
@@ -1248,6 +1327,7 @@ classes = (
     node_panel(EEVEE_MATERIAL_PT_settings),
     node_panel(EEVEE_MATERIAL_PT_settings_surface),
     node_panel(EEVEE_MATERIAL_PT_settings_volume),
+    node_panel(EEVEE_MATERIAL_PT_settings_shader_compilation),
     node_panel(MATERIAL_PT_viewport),
     node_panel(WORLD_PT_viewport_display),
     node_panel(DATA_PT_light),

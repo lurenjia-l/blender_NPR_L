@@ -6,6 +6,7 @@
  * \ingroup RNA
  */
 
+#include <algorithm>
 #include <cstdlib>
 
 #include "DNA_action_types.h"
@@ -273,6 +274,16 @@ const EnumPropertyItem rna_enum_object_axis_items[] = {
     {0, nullptr, 0, nullptr, nullptr},
 };
 
+const EnumPropertyItem rna_enum_object_axis_flip_items[] = {
+    {OB_POSX, "POS_X", 0, "-X to +X", ""},
+    {OB_POSY, "POS_Y", 0, "-Y to +Y", ""},
+    {OB_POSZ, "POS_Z", 0, "-Z to +Z", ""},
+    {OB_NEGX, "NEG_X", 0, "+X to -X", ""},
+    {OB_NEGY, "NEG_Y", 0, "+Y to -Y", ""},
+    {OB_NEGZ, "NEG_Z", 0, "+Z to -Z", ""},
+    {0, nullptr, 0, nullptr, nullptr},
+};
+
 }  // namespace blender
 
 #ifdef RNA_RUNTIME
@@ -344,7 +355,8 @@ const EnumPropertyItem rna_enum_object_axis_items[] = {
 
 namespace blender {
 
-static void rna_Object_tag_dependent_node_trees(Main *bmain, Object *object)
+static void rna_Object_tag_dependent_node_trees(Main *bmain,
+                                                Object *object)
 {
   Set<ID *> changed_ntree_ids;
   Set<ID *> changed_owner_ids;
@@ -352,7 +364,9 @@ static void rna_Object_tag_dependent_node_trees(Main *bmain, Object *object)
   FOREACH_NODETREE_BEGIN (bmain, ntree, owner_id) {
     bool tree_uses_object_id = false;
     for (bNode *node : ntree->all_nodes()) {
-      if (node->id == &object->id) {
+      const bool uses_referenced_object_data =
+          node->typeinfo != nullptr && node->typeinfo->gpu_uses_referenced_object_data;
+      if (node->id == &object->id && !uses_referenced_object_data) {
         BKE_ntree_update_tag_node_property(ntree, node);
         tree_uses_object_id = true;
       }
@@ -551,6 +565,8 @@ static void rna_Object_active_shape_update(Main *bmain, Scene * /*scene*/, Point
         BKE_editlattice_load(ob);
         BKE_editlattice_make(ob);
         break;
+      default:
+        break;
     }
   }
 
@@ -739,11 +755,11 @@ static void rna_Object_parent_type_set(PointerRNA *ptr, int value)
 
   /* Skip if type did not change (otherwise we loose parent inverse in
    * ed::object::parent_set). */
-  if (ob->partype == value) {
+  if (ob->partype == eObject_Partype(value)) {
     return;
   }
 
-  ed::object::parent_set(ob, ob->parent, value, ob->parsubstr);
+  ed::object::parent_set(ob, ob->parent, eObject_Partype(value), ob->parsubstr);
 }
 
 static bool rna_Object_parent_type_override_apply(Main *bmain,
@@ -774,7 +790,7 @@ static bool rna_Object_parent_type_override_apply(Main *bmain,
     return false;
   }
 
-  ob->partype = parent_type_src;
+  ob->partype = eObject_Partype(parent_type_src);
   RNA_property_update_main(bmain, nullptr, ptr_dst, prop_dst);
   return true;
 }
@@ -894,9 +910,9 @@ static void rna_Object_dup_collection_set(PointerRNA *ptr,
 
   /* Must not let this be set if the object belongs in this group already,
    * thus causing a cycle/infinite-recursion leading to crashes on load #25298. */
-  if (BKE_collection_has_object_recursive(grp, ob) == 0) {
+  if (BKE_collection_has_object_recursive_instanced(grp, ob) == 0) {
     if (ob->type == OB_EMPTY) {
-      id_us_min(&ob->instance_collection->id);
+      id_us_min(id_cast<ID *>(ob->instance_collection));
       ob->instance_collection = grp;
       id_us_plus(&ob->instance_collection->id);
     }
@@ -905,11 +921,10 @@ static void rna_Object_dup_collection_set(PointerRNA *ptr,
     }
   }
   else {
-    BKE_report(
-        nullptr,
-        RPT_ERROR,
-        "Cannot set instance-collection as object belongs in collection being instanced, thus "
-        "causing a cycle");
+    BKE_report(nullptr,
+               RPT_ERROR,
+               "Cannot set instance-collection as object belongs (directly or indirectly) in "
+               "collection being instanced, thus causing a dependency cycle");
   }
 }
 
@@ -1024,7 +1039,7 @@ static void rna_Object_active_vertex_group_index_range(
     return;
   }
   const ListBaseT<bDeformGroup> *defbase = BKE_object_defgroup_list(ob);
-  *max = max_ii(0, BLI_listbase_count(defbase) - 1);
+  *max = max_ii(0, defbase->count() - 1);
 }
 
 void rna_object_vgroup_name_index_get(PointerRNA *ptr, char *value, int index)
@@ -1253,7 +1268,7 @@ static void rna_Object_active_particle_system_index_range(
 {
   Object *ob = reinterpret_cast<Object *>(ptr->owner_id);
   *min = 0;
-  *max = max_ii(0, BLI_listbase_count(&ob->particlesystem) - 1);
+  *max = max_ii(0, ob->particlesystem.count() - 1);
 }
 
 static int rna_Object_active_particle_system_index_get(PointerRNA *ptr)
@@ -1307,8 +1322,12 @@ static void rna_Object_rotation_mode_set(PointerRNA *ptr, int value)
   Object *ob = static_cast<Object *>(ptr->data);
 
   /* use API Method for conversions... */
-  BKE_rotMode_change_values(
-      ob->quat, ob->rot, ob->rotAxis, &ob->rotAngle, ob->rotmode, short(value));
+  BKE_rotMode_change_values(ob->quat,
+                            ob->rot,
+                            ob->rotAxis,
+                            &ob->rotAngle,
+                            eRotationModes(ob->rotmode),
+                            eRotationModes(value));
 
   /* finally, set the new rotation type */
   ob->rotmode = clamp_i(value, ROT_MODE_MIN, ROT_MODE_MAX);
@@ -1625,7 +1644,7 @@ static void rna_Object_active_shape_key_index_range(
 
   *min = 0;
   if (key) {
-    *max = BLI_listbase_count(&key->block) - 1;
+    *max = key->block.count() - 1;
     if (*max < 0) {
       *max = 0;
     }
@@ -1699,7 +1718,7 @@ static void rna_Object_active_constraint_set(PointerRNA *ptr,
 
 static bConstraint *rna_Object_constraints_new(Object *object, Main *bmain, int type)
 {
-  bConstraint *new_con = BKE_constraint_add_for_object(object, nullptr, type);
+  bConstraint *new_con = BKE_constraint_add_for_object(object, nullptr, eBConstraint_Types(type));
 
   ed::object::constraint_tag_update(bmain, object, new_con);
   WM_main_add_notifier(NC_OBJECT | ND_CONSTRAINT | NA_ADDED, object);
@@ -1940,9 +1959,9 @@ bool rna_Object_modifiers_override_apply(Main *bmain,
      * modifier).
      *
      * Try to handle this by finding already existing one here. */
-    const ModifierTypeInfo *mti = BKE_modifier_get_info(ModifierType(mod_src->type));
+    const ModifierTypeInfo *mti = BKE_modifier_get_info(mod_src->type);
     if (mti->flags & eModifierTypeFlag_Single) {
-      mod_dst = BKE_modifiers_findby_type(ob_dst, ModifierType(mod_src->type));
+      mod_dst = BKE_modifiers_findby_type(ob_dst, mod_src->type);
     }
 
     if (mod_dst == nullptr) {
@@ -2014,7 +2033,7 @@ static void rna_Object_boundbox_get(PointerRNA *ptr, float *values)
     *reinterpret_cast<std::array<float3, 8> *>(values) = bounds::corners(*bounds);
   }
   else {
-    copy_vn_fl(values, 8 * 3, 0.0f);
+    std::fill_n(values, 8 * 3, 0.0f);
   }
 }
 
@@ -2072,7 +2091,9 @@ static void rna_Object_vgroup_remove(Object *ob,
   BKE_object_defgroup_remove(ob, defgroup);
   defgroup_ptr->invalidate();
 
+  DEG_id_tag_update(&ob->id, ID_RECALC_GEOMETRY);
   DEG_relations_tag_update(bmain);
+  WM_main_add_notifier(NC_GEOM | ND_VERTEX_GROUP, ob->data);
   WM_main_add_notifier(NC_OBJECT | ND_DRAW, ob);
 }
 
@@ -2084,7 +2105,9 @@ static void rna_Object_vgroup_clear(Object *ob, Main *bmain, ReportList *reports
 
   BKE_object_defgroup_remove_all(ob);
 
+  DEG_id_tag_update(&ob->id, ID_RECALC_GEOMETRY);
   DEG_relations_tag_update(bmain);
+  WM_main_add_notifier(NC_GEOM | ND_VERTEX_GROUP, ob->data);
   WM_main_add_notifier(NC_OBJECT | ND_DRAW, ob);
 }
 
@@ -3048,6 +3071,14 @@ static void rna_def_object_visibility(StructRNA *srna)
       "footage. Objects with this setting are considered to already exist in the footage, "
       "objects without it are synthetic objects being composited into it.");
   RNA_def_property_update(prop, NC_OBJECT | ND_DRAW, "rna_Object_internal_update_draw");
+
+  prop = RNA_def_property(srna, "visible_raycast", PROP_BOOLEAN, PROP_NONE);
+  RNA_def_property_boolean_negative_sdna(prop, nullptr, "visibility_flag", OB_HIDE_RAYCAST);
+  RNA_def_property_ui_text(
+      prop,
+      "Raycast Visibility",
+      "Object visibility to raycast rays. Implicitly false for Blended materials.");
+  RNA_def_property_update(prop, NC_OBJECT | ND_DRAW, "rna_Object_internal_update_draw");
 }
 
 static void rna_def_object(BlenderRNA *brna)
@@ -3162,6 +3193,13 @@ static void rna_def_object(BlenderRNA *brna)
   RNA_def_property_ui_text(
       prop, "Parent Bone", "Name of parent bone in case of a bone parenting relation");
   RNA_def_property_update(prop, NC_OBJECT | ND_DRAW, "rna_Object_dependency_update");
+
+  prop = RNA_def_property(srna, "parent_bone_head_tail_factor", PROP_FLOAT, PROP_FACTOR);
+  RNA_def_property_float_sdna(prop, nullptr, "parent_bone_head_tail_factor");
+  RNA_def_property_range(prop, 0.0f, 1.0f);
+  RNA_def_property_ui_range(prop, 0.0, 1.0, 1, 2);
+  RNA_def_property_ui_text(prop, "Parent Bone Head/Tail", "Position along the length of bone");
+  RNA_def_property_update(prop, NC_OBJECT | ND_DRAW, "rna_Object_internal_update");
 
   prop = RNA_def_property(srna, "use_parent_final_indices", PROP_BOOLEAN, PROP_NONE);
   RNA_def_property_boolean_sdna(prop, nullptr, "transflag", OB_PARENT_USE_FINAL_INDICES);

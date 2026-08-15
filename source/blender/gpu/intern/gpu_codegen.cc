@@ -152,6 +152,7 @@ GPUCodegen::GPUCodegen(GPUMaterial *mat_, GPUNodeGraph *graph_, const char *debu
 {
   BLI_hash_mm2a_init(&hm2a_, GPU_material_uuid_get(&mat));
   BLI_hash_mm2a_add_int(&hm2a_, GPU_material_flag(&mat));
+  BLI_hash_mm2a_add_int(&hm2a_, GPU_material_recompile_serial_get(&mat));
   create_info = MEM_new<GPUCodegenCreateInfo>(__func__, debug_name);
   output.create_info = reinterpret_cast<GPUShaderCreateInfo *>(
       static_cast<ShaderCreateInfo *>(create_info));
@@ -161,7 +162,7 @@ GPUCodegen::~GPUCodegen()
 {
   MEM_SAFE_DELETE(cryptomatte_input_);
   MEM_delete(create_info);
-  BLI_freelistN(&ubo_inputs_);
+  ubo_inputs_.free_no_destruct();
 };
 
 bool GPUCodegen::should_optimize_heuristic() const
@@ -175,7 +176,7 @@ bool GPUCodegen::should_optimize_heuristic() const
 
 void GPUCodegen::generate_attribs()
 {
-  if (BLI_listbase_is_empty(&graph.attributes)) {
+  if (graph.attributes.is_empty()) {
     output.attr_load.clear();
     return;
   }
@@ -287,7 +288,7 @@ void GPUCodegen::generate_resources()
   /* Increment heuristic. */
   textures_total_ = slot;
 
-  if (!BLI_listbase_is_empty(&ubo_inputs_)) {
+  if (!ubo_inputs_.is_empty()) {
     const char *linted_struct_suffix = "_host_shared_";
     /* NOTE: generate_uniform_buffer() should have sorted the inputs before this. */
     ss << "struct NodeTree {\n";
@@ -308,7 +309,7 @@ void GPUCodegen::generate_resources()
     info.uniform_buf(GPU_NODE_TREE_UBO_SLOT, "NodeTree", GPU_UBO_BLOCK_NAME, Frequency::BATCH);
   }
 
-  if (!BLI_listbase_is_empty(&graph.uniform_attrs.list)) {
+  if (!graph.uniform_attrs.list.is_empty()) {
     ss << "struct UniformAttrs {\n";
     for (GPUUniformAttr &attr : graph.uniform_attrs.list) {
       ss << "vec4 attr" << attr.id << ";\n";
@@ -322,7 +323,7 @@ void GPUCodegen::generate_resources()
     info.uniform_buf(2, "UniformAttrs", GPU_ATTRIBUTE_UBO_BLOCK_NAME "[512]", Frequency::BATCH);
   }
 
-  if (!BLI_listbase_is_empty(&graph.layer_attrs)) {
+  if (!graph.layer_attrs.is_empty()) {
     info.additional_info("draw_layer_attributes");
   }
 
@@ -344,6 +345,9 @@ void GPUCodegen::node_serialize(Set<StringRefNull> &used_libraries,
   }
   if (node->dependency_flags & GPU_CUSTOM_NODE_DEPENDENCY_GLSL_LIGHTPROBE_HELPERS) {
     used_libraries.add(GPU_GLSL_FUNCTION_LIGHTPROBE_HELPER_FILENAME);
+  }
+  if (node->dependency_flags & GPU_CUSTOM_NODE_DEPENDENCY_GLSL_MATRIX_HELPERS) {
+    used_libraries.add(GPU_GLSL_FUNCTION_MATRIX_HELPER_FILENAME);
   }
 
   auto source_reference = [&](GPUInput *input) {
@@ -563,7 +567,7 @@ void GPUCodegen::generate_uniform_buffer()
       }
     }
   }
-  if (!BLI_listbase_is_empty(&ubo_inputs_)) {
+  if (!ubo_inputs_.is_empty()) {
     /* This sorts the inputs based on size. */
     GPU_material_uniform_buffer_create(&mat, &ubo_inputs_);
   }
@@ -663,37 +667,108 @@ void GPUCodegen::generate_graphs()
   }
   output.npr = graph_serialize(
       GPU_NODE_TAG_NPR | GPU_NODE_TAG_OUTLINE, graph.outlink_npr, "float4(0.0f)");
-  output.filter = graph_serialize(GPU_NODE_TAG_FILTER | GPU_NODE_TAG_AOV,
-                                  graph.outlink_filter,
-                                  nullptr);
+  if (!BLI_listbase_is_empty(&graph.outlink_filters)) {
+    for (GPUNodeGraphOutputLink &filter_link : graph.outlink_filters) {
+      for (GPUNode &node : graph.nodes) {
+        node.tag &= ~GPU_NODE_TAG_FILTER;
+      }
+      gpu_nodes_tag(&graph, filter_link.outlink, GPU_NODE_TAG_FILTER);
+      GPUGraphOutput filter_graph = graph_serialize(GPU_NODE_TAG_FILTER,
+                                                    filter_link.outlink,
+                                                    nullptr);
+      output.filter_output_identifiers.append(filter_link.hash);
+      output.filter_outputs.append(filter_graph);
+    }
+    for (GPUNodeGraphOutputLink &filter_link : graph.outlink_filters) {
+      gpu_nodes_tag(&graph, filter_link.outlink, GPU_NODE_TAG_FILTER);
+    }
+    if (!output.filter_outputs.is_empty()) {
+      output.filter = output.filter_outputs.first();
+    }
+  }
+  else {
+    output.filter = graph_serialize(GPU_NODE_TAG_FILTER | GPU_NODE_TAG_AOV,
+                                    graph.outlink_filter,
+                                    nullptr);
+  }
   if (graph.outlink_light_shader != nullptr) {
     output.light_shader = graph_serialize(
         GPU_NODE_TAG_LIGHT_SHADER, graph.outlink_light_shader, "float4(1.0f)");
   }
-  if (!BLI_listbase_is_empty(&graph.outlink_compositor)) {
+  if (!graph.outlink_compositor.is_empty()) {
     output.composite = graph_serialize(GPU_NODE_TAG_COMPOSITOR);
   }
 
-  if (!BLI_listbase_is_empty(&graph.material_functions)) {
+  if (!graph.material_functions.is_empty()) {
     for (GPUNodeGraphFunctionLink &func_link : graph.material_functions) {
       std::stringstream eval_ss;
       /* Untag every node in the graph to avoid serializing nodes from other functions */
       for (GPUNode &node : graph.nodes) {
         node.tag &= ~GPU_NODE_TAG_FUNCTION;
       }
-      /* Tag only the nodes needed for the current function */
-      gpu_nodes_tag(&graph, func_link.outlink, GPU_NODE_TAG_FUNCTION);
-      GPUGraphOutput graph = graph_serialize(GPU_NODE_TAG_FUNCTION, func_link.outlink);
-      if (func_link.dependency_name[0] != '\0') {
-        graph.dependencies.append_non_duplicates(func_link.dependency_name);
+      if (func_link.mode == GPU_NODE_GRAPH_FUNCTION_LEGACY) {
+        /* Tag only the nodes needed for the current function */
+        gpu_nodes_tag(&graph, func_link.outlink, GPU_NODE_TAG_FUNCTION);
+        GPUGraphOutput graph = graph_serialize(GPU_NODE_TAG_FUNCTION, func_link.outlink);
+        if (func_link.dependency_name[0] != '\0') {
+          graph.dependencies.append_non_duplicates(func_link.dependency_name);
+        }
+        eval_ss << func_link.return_type << " " << func_link.name << "() {\n"
+                << graph.serialized << "}\n\n";
+        output.material_functions.append({eval_ss.str(), graph.dependencies});
       }
-      eval_ss << func_link.return_type << " " << func_link.name << "() {\n"
-              << graph.serialized << "}\n\n";
-      output.material_functions.append({eval_ss.str(), graph.dependencies});
+      else {
+        BLI_assert(func_link.mode == GPU_NODE_GRAPH_FUNCTION_MULTI_IO);
+        for (int output_index = 0; output_index < func_link.outputs_len; output_index++) {
+          gpu_nodes_tag(&graph, func_link.outputs[output_index].outlink, GPU_NODE_TAG_FUNCTION);
+        }
+        GPUGraphOutput function_graph = graph_serialize(GPU_NODE_TAG_FUNCTION);
+        if (func_link.dependency_name[0] != '\0') {
+          function_graph.dependencies.append_non_duplicates(func_link.dependency_name);
+        }
+
+        eval_ss << "void " << func_link.name << "(";
+        bool is_first_parameter = true;
+        for (int input_index = 0; input_index < func_link.input_types_len; input_index++) {
+          if (!is_first_parameter) {
+            eval_ss << ", ";
+          }
+          eval_ss << func_link.input_types[input_index] << " in" << input_index;
+          is_first_parameter = false;
+        }
+        for (int output_index = 0; output_index < func_link.outputs_len; output_index++) {
+          if (!is_first_parameter) {
+            eval_ss << ", ";
+          }
+          eval_ss << "out " << func_link.outputs[output_index].type << " out" << output_index;
+          is_first_parameter = false;
+        }
+        eval_ss << ") {\n" << function_graph.serialized;
+        for (int output_index = 0; output_index < func_link.outputs_len; output_index++) {
+          BLI_assert(func_link.outputs[output_index].outlink != nullptr &&
+                     func_link.outputs[output_index].outlink->output != nullptr);
+          eval_ss << "out" << output_index << " = "
+                  << func_link.outputs[output_index].outlink->output << ";\n";
+        }
+        eval_ss << "}\n\n";
+
+        const std::string serialized = eval_ss.str();
+        BLI_hash_mm2a_add(
+            &hm2a_, reinterpret_cast<const uchar *>(serialized.c_str()), serialized.size());
+        output.material_functions.append({serialized, function_graph.dependencies});
+      }
     }
     /* Leave the function tags as they were before serialization */
     for (GPUNodeGraphFunctionLink &funclink : graph.material_functions) {
-      gpu_nodes_tag(&graph, funclink.outlink, GPU_NODE_TAG_FUNCTION);
+      if (funclink.mode == GPU_NODE_GRAPH_FUNCTION_LEGACY) {
+        gpu_nodes_tag(&graph, funclink.outlink, GPU_NODE_TAG_FUNCTION);
+      }
+      else {
+        BLI_assert(funclink.mode == GPU_NODE_GRAPH_FUNCTION_MULTI_IO);
+        for (int output_index = 0; output_index < funclink.outputs_len; output_index++) {
+          gpu_nodes_tag(&graph, funclink.outputs[output_index].outlink, GPU_NODE_TAG_FUNCTION);
+        }
+      }
     }
   }
 

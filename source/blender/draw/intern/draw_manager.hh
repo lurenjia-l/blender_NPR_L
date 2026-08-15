@@ -20,6 +20,7 @@
 
 #include "GPU_material.hh"
 
+#include "draw_handle.hh"
 #include "draw_resource.hh"
 #include "draw_view.hh"
 
@@ -110,6 +111,11 @@ class Manager {
   /** Number of object attribute recorded. */
   uint attribute_len_ = 0;
 
+  /** Unique referenced objects requested by all materials in this manager. */
+  Map<uint32_t, GPUReferencedObject> referenced_objects_;
+  uint referenced_object_table_offset_ = 0;
+  uint referenced_object_table_size_ = 0;
+
   Object *object_active = nullptr;
 
  public:
@@ -165,17 +171,18 @@ class Manager {
    * Populate additional per resource data on demand.
    * IMPORTANT: Should be called only **once** per object.
    */
-  void extract_object_attributes(ResourceHandle handle,
+  void extract_object_attributes(ResourceHandleRange handle,
                                  const ObjectRef &ref,
                                  const GPUMaterial *material);
-  void extract_object_attributes(ResourceHandle handle,
+  void extract_object_attributes(ResourceHandleRange handle,
                                  const ObjectRef &ref,
                                  Span<GPUMaterial *> materials);
 
   /**
    * Collect necessary View Layer attributes.
    */
-  void register_layer_attributes(GPUMaterial *material);
+  /** Collect layer attributes and referenced-object requests from a material. */
+  void register_material_resources(GPUMaterial *material);
 
   /**
    * Compute <-> Graphic queue transition is quite slow on some backend. To avoid unnecessary
@@ -303,6 +310,7 @@ class Manager {
 
  private:
   void sync_layer_attributes();
+  void sync_referenced_objects();
 
   /* Fingerprint of the manager in a certain state. Assured to not be 0.
    * Not reliable enough for general update detection. Only to be used for debugging assertion. */
@@ -425,63 +433,64 @@ inline void Manager::update_handle_bounds(ResourceHandle handle,
                                           const ObjectRef &ref,
                                           float inflate_bounds)
 {
-  bounds_buf.current()[handle.resource_index()].sync(*ref.object, inflate_bounds);
+  bounds_buf.current()[handle.index()].sync(*ref.object, inflate_bounds);
 }
 
-inline void Manager::extract_object_attributes(ResourceHandle handle,
+inline void Manager::extract_object_attributes(ResourceHandleRange handle,
                                                const ObjectRef &ref,
                                                const GPUMaterial *material)
 {
-  const uint resource_index = handle.resource_index();
-  ObjectInfos &infos = infos_buf.current().get_or_resize(resource_index);
-  infos.object_attrs_offset = attribute_len_;
-
   const GPUUniformAttrList *attr_list = GPU_material_uniform_attributes(material);
-  if (attr_list == nullptr) {
-    return;
-  }
 
-  for (const GPUUniformAttr &attr : attr_list->list) {
-    if (attributes_buf.get_or_resize(attribute_len_).sync(ref, *&attr)) {
-      infos.object_attrs_len++;
-      attribute_len_++;
+  int instance_index = 0;
+  for (ResourceID resource_id : handle.id_range()) {
+    ObjectInfos &infos = infos_buf.current().get_or_resize(resource_id.index());
+    infos.object_attrs_offset = attribute_len_;
+    infos.object_attrs_len = 0;
+    if (attr_list != nullptr) {
+      for (const GPUUniformAttr &attr : attr_list->list) {
+        if (attributes_buf.get_or_resize(attribute_len_).sync(ref, *&attr, instance_index)) {
+          infos.object_attrs_len++;
+          attribute_len_++;
+        }
+      }
     }
+    instance_index++;
   }
 }
 
-inline void Manager::extract_object_attributes(ResourceHandle handle,
+inline void Manager::extract_object_attributes(ResourceHandleRange handle,
                                                const ObjectRef &ref,
                                                Span<GPUMaterial *> materials)
 {
-  const uint resource_index = handle.resource_index();
-  ObjectInfos &infos = infos_buf.current().get_or_resize(resource_index);
-  infos.object_attrs_offset = attribute_len_;
-
-  /* Simple cache solution to avoid duplicates. */
-  Vector<uint32_t, 4> hash_cache;
+  Map<uint32_t, const GPUUniformAttr *, 4> attributes;
 
   for (const GPUMaterial *mat : materials) {
     const GPUUniformAttrList *attr_list = GPU_material_uniform_attributes(mat);
     if (attr_list == nullptr) {
       continue;
     }
-
     for (const GPUUniformAttr &attr : attr_list->list) {
-      /** WATCH: Linear Search. Avoid duplicate attributes across materials. */
-      if ((mat != materials.first()) && (hash_cache.first_index_of_try(attr.hash_code) != -1)) {
-        /* Attribute has already been added to the attribute buffer by another material. */
-        continue;
-      }
-      hash_cache.append(attr.hash_code);
-      if (attributes_buf.get_or_resize(attribute_len_).sync(ref, *&attr)) {
+      attributes.add(attr.hash_code, &attr);
+    }
+  }
+
+  int instance_index = 0;
+  for (ResourceID resource_id : handle.id_range()) {
+    ObjectInfos &infos = infos_buf.current().get_or_resize(resource_id.index());
+    infos.object_attrs_offset = attribute_len_;
+    infos.object_attrs_len = 0;
+    for (const GPUUniformAttr *attr : attributes.values()) {
+      if (attributes_buf.get_or_resize(attribute_len_).sync(ref, *attr, instance_index)) {
         infos.object_attrs_len++;
         attribute_len_++;
       }
     }
+    instance_index++;
   }
 }
 
-inline void Manager::register_layer_attributes(GPUMaterial *material)
+inline void Manager::register_material_resources(GPUMaterial *material)
 {
   const ListBaseT<GPULayerAttr> *attr_list = GPU_material_layer_attributes(material);
 
@@ -491,6 +500,16 @@ inline void Manager::register_layer_attributes(GPUMaterial *material)
        *  this only collects a table of their names. */
       layer_attributes.add(attr.hash_code, *&attr);
     }
+  }
+
+  const int referenced_object_count = GPU_material_referenced_object_count(material);
+  for (int index = 0; index < referenced_object_count; index++) {
+    const GPUReferencedObject *request = GPU_material_referenced_object_get(material, index);
+    if (request == nullptr || request->session_uid == 0) {
+      continue;
+    }
+    GPUReferencedObject &entry = referenced_objects_.lookup_or_add(request->session_uid, *request);
+    entry.flags |= request->flags;
   }
 }
 

@@ -4,18 +4,25 @@
 
 #pragma once
 
+/* Marker so EEVEE's BSL material library (eevee_nodetree_lib.bsl.hh) can detect that the legacy
+ * draw-view free functions are provided directly here, and skip its own compatibility shims. Only
+ * the legacy passes include this file; the BSL material passes use draw_view.bsl.hh instead. */
+#define DRW_VIEW_LIB_INCLUDED
+
 #include "draw_view_infos.hh"
 
 SHADER_LIBRARY_CREATE_INFO(draw_view)
 
 #if !defined(DRAW_VIEW_CREATE_INFO) && !defined(GLSL_CPP_STUBS)
-#  error Missing draw_view additional create info on shader create info
-#endif
+#else
+
+#  define DRW_VIEW_LIB_FUNCTIONS_DEFINED
 
 /* Returns the current active view. */
 ViewMatrices drw_view()
 {
-  return drw_view_buf[drw_view_id];
+
+  return buffer_get(draw_view, view_buf)[drw_view_id];
 }
 
 /* Returns true if the current view has a perspective projection matrix. */
@@ -210,3 +217,4 @@ float drw_depth_screen_to_view(float ss_depth)
 }
 
 /** \} */
+#endif

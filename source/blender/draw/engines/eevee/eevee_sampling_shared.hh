@@ -44,9 +44,9 @@ enum [[host_shared]] eSamplingDimension : uint32_t {
   SAMPLING_SHADOW_I = 26u,
   SAMPLING_SHADOW_J = 27u,
   SAMPLING_SHADOW_K = 28u,
-  SAMPLING_UNUSED_0 = 29u,
-  SAMPLING_UNUSED_1 = 30u,
-  SAMPLING_UNUSED_2 = 31u,
+  SAMPLING_GBUFFER_U = 29u,
+  SAMPLING_GBUFFER_V = 30u,
+  SAMPLING_GBUFFER_W = 31u,
 };
 
 /**
@@ -59,6 +59,12 @@ enum [[host_shared]] eSamplingDimension : uint32_t {
 struct [[host_shared]] SamplingData {
   /** Array containing random values from Low Discrepancy Sequence in [0..1) range. */
   float dimensions[SAMPLING_DIMENSION_COUNT];
+  /** 0 based current sample index exposed to material nodes. */
+  int sample_index;
+  /** Actual EEVEE target sample count exposed to material nodes. */
+  int sample_count;
+  int _pad0;
+  int _pad1;
 };
 
 /* Returns total sample count in a web pattern of the given size. */

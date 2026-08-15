@@ -38,11 +38,21 @@ struct TextureHandle {
   int index;
 };
 
+/* Scene Color is a filter-domain handle. Keep it outside the existing NPR/world ranges. */
+#define TEX_HANDLE_SCENE 30u
+#define TEX_HANDLE_FILTER_GRAPH_INPUT 31u
+#define TEX_HANDLE_FILTER_GRAPH_TEXTURE 32u
+
 #define TEXTURE_HANDLE_DEFAULT TextureHandle(0u, 0)
 
 #if defined(NPR_SHADER) || defined(MAT_FILTER)
 float4 TextureHandle_eval(TextureHandle tex, float2 offset, bool texel_offset);
 float4 TextureHandle_eval(TextureHandle tex);
+float4 TextureHandle_eval_uv(TextureHandle tex, float2 uv);
+#  if defined(MAT_FILTER)
+bool TextureHandle_stores_transmittance_alpha(TextureHandle tex);
+bool TextureHandle_is_scene_depth(TextureHandle tex);
+#  endif
 #else
 float4 TextureHandle_eval(TextureHandle tex, float2 offset, bool texel_offset)
 {
@@ -52,6 +62,11 @@ float4 TextureHandle_eval(TextureHandle tex, float2 offset, bool texel_offset)
 float4 TextureHandle_eval(TextureHandle tex)
 {
   return TextureHandle_eval(tex, float2(0.0f), false);
+}
+
+float4 TextureHandle_eval_uv(TextureHandle tex, float2 uv)
+{
+  return TextureHandle_eval(tex, uv, false);
 }
 #endif
 
@@ -85,7 +100,6 @@ float4 TextureHandle_eval(TextureHandle tex)
 #  define FrontFacing true
 #endif
 
-/* Can't use enum here because not a header file. But would be great to do. */
 enum ClosureType : uchar {
   CLOSURE_NONE_ID = 0u,
   /* Diffuse */
@@ -104,12 +118,13 @@ enum ClosureType : uchar {
 
   /* Transmission */
   CLOSURE_BSDF_MICROFACET_GGX_REFRACTION_ID = 12u,
+  CLOSURE_BSDF_THIN_GLASS_TRANSMISSION_ID = 13u,
 
   /* Glass */
-  // CLOSURE_BSDF_HAIR_HUANG_ID = 13u, /* TODO */
+  // CLOSURE_BSDF_HAIR_HUANG_ID = 14u, /* TODO */
 
   /* BSSRDF */
-  CLOSURE_BSSRDF_BURLEY_ID = 14u,
+  CLOSURE_BSSRDF_BURLEY_ID = 15u,
 };
 
 struct ClosureUndetermined {
@@ -120,6 +135,13 @@ struct ClosureUndetermined {
   /* Additional data different for each closure type. */
   packed_float4 data;
 };
+
+bool closure_has_transmission(const ClosureType closure)
+{
+  return closure == CLOSURE_BSDF_TRANSLUCENT_ID ||
+         closure == CLOSURE_BSDF_MICROFACET_GGX_REFRACTION_ID ||
+         closure == CLOSURE_BSDF_THIN_GLASS_TRANSMISSION_ID;
+}
 
 ClosureUndetermined closure_new(ClosureType type)
 {
@@ -196,6 +218,13 @@ struct ClosureTransparency {
   float holdout;
 };
 
+struct ClosureThinRefraction {
+  packed_float3 color;
+  float weight;
+  packed_float3 N;
+  float roughness;
+};
+
 ClosureDiffuse to_closure_diffuse(ClosureUndetermined cl)
 {
   ClosureDiffuse closure;
@@ -237,6 +266,15 @@ ClosureRefraction to_closure_refraction(ClosureUndetermined cl)
   closure.color = cl.color;
   closure.roughness = cl.data.x;
   closure.ior = cl.data.y;
+  return closure;
+}
+
+ClosureThinRefraction to_closure_thin_refraction(ClosureUndetermined cl)
+{
+  ClosureThinRefraction closure;
+  closure.N = cl.N;
+  closure.color = cl.color;
+  closure.roughness = cl.data.x;
   return closure;
 }
 
@@ -330,6 +368,3 @@ float3 dF_impl(float3 v)
       g_derivative_flag = 0; \
     }
 #endif
-
-/* TODO(fclem): Remove. */
-#define CODEGEN_LIB

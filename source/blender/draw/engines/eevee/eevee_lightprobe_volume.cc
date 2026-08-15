@@ -292,6 +292,7 @@ void VolumeProbeModule::set_view(View & /*view*/)
     grid_upload_ps_.bind_ssbo("bricks_infos_buf", &bricks_infos_buf_);
     grid_upload_ps_.push_constant("grid_index", world_grid_index);
     grid_upload_ps_.bind_image("irradiance_atlas_img", &irradiance_atlas_tx_);
+    grid_upload_ps_.bind_texture("irradiance_atlas_tx", &irradiance_atlas_tx_);
     /* Sync with extraction. */
     grid_upload_ps_.barrier(GPU_BARRIER_SHADER_STORAGE);
     /* Only upload one brick. */
@@ -305,6 +306,9 @@ void VolumeProbeModule::set_view(View & /*view*/)
   /* Upload data for each grid that need to be inserted in the atlas.
    * Upload by order of dependency. */
   /* Start at world index to not load any other grid (+1 because we decrement at loop start). */
+  int updated_grid_count = 0;
+  int max_grid_resolution = 0;
+  double estimated_grid_work = 0.0;
   int grid_start_index = grid_loaded.size() + 1;
   for (auto it = grid_loaded.rbegin(); it != grid_loaded.rend(); ++it) {
     grid_start_index--;
@@ -327,6 +331,10 @@ void VolumeProbeModule::set_view(View & /*view*/)
 
     eGPUTextureUsage usage = GPU_TEXTURE_USAGE_SHADER_READ;
     int3 grid_size = int3(cache->size);
+    updated_grid_count++;
+    max_grid_resolution = max_ii(max_grid_resolution, math::reduce_max(grid_size));
+    estimated_grid_work += double(grid_size.x) * double(grid_size.y) * double(grid_size.z) /
+                           1000000.0;
     if (cache->baking.L0) {
       irradiance_a_tx.ensure_3d(gpu::TextureFormat::SFLOAT_16_16_16_16,
                                 grid_size,
@@ -483,6 +491,14 @@ void VolumeProbeModule::set_view(View & /*view*/)
     irradiance_c_tx.free();
     irradiance_d_tx.free();
   }
+
+  inst_.light_probes.probe_cost_accumulate("Volume Probes",
+                                           "VOLUME",
+                                           updated_grid_count,
+                                           inst_.light_probes.volume_probe_count(),
+                                           0,
+                                           max_grid_resolution,
+                                           estimated_grid_work);
 
   do_update_world_ = false;
 }
@@ -1237,11 +1253,13 @@ void IrradianceBake::surfels_create(const Object &probe_object)
 void IrradianceBake::surfels_lights_eval()
 {
   /* Use the last setup view. This should work since the view is orthographic. */
-  /* TODO(fclem): Remove this. It is only present to avoid crash inside `shadows.set_view` */
+  /* TODO(fclem): Remove this. It is only present to avoid crash inside `shadows.render` */
   inst_.render_buffers.acquire(int2(1));
   inst_.hiz_buffer.set_source(&inst_.render_buffers.depth_tx);
-  inst_.lights.set_view(view_z_, grid_pixel_extent_.xy());
   inst_.shadows.set_view(view_z_, grid_pixel_extent_.xy());
+  inst_.uniform_data.data.push_update();
+  inst_.lights.set_view(view_z_, grid_pixel_extent_.xy());
+  inst_.shadows.render(view_z_, grid_pixel_extent_.xy());
   inst_.lights.eval_uniform_light_shaders(view_z_);
   inst_.lights.eval_surfel_light_shaders(
       view_z_, surfels_buf_, capture_info_buf_, capture_info_buf_.surfel_len);

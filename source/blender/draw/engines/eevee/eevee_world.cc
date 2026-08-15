@@ -33,7 +33,7 @@ blender::World *World::default_world_get()
   if (default_world_ == nullptr) {
     default_world_ = BKE_id_new_nomain<blender::World>("EEVEE default world");
 
-    BLI_listbase_clear(&default_world_->gpumaterial);
+    default_world_->gpumaterial.clear_no_delete();
   }
   return default_world_;
 }
@@ -63,17 +63,28 @@ float World::sun_threshold()
   return sun_threshold;
 }
 
+void World::sunlight_clear()
+{
+  for (LightData &sun : sunlight) {
+    sun = {};
+    sun.object_to_world = float4x4::identity();
+    sun.power = float4(0.0f);
+    sun.color = float3(0.0f);
+    sun.type = LIGHT_SUN;
+    sun.tilemap_index = LIGHT_NO_SHADOW;
+    sun.sun().direction = float3(0.0f, 0.0f, 1.0f);
+  }
+  sunlight.push_update();
+}
+
 void World::sync()
 {
   bool has_update = false;
   uses_scene_time_ = false;
 
-  WorldHandle wo_handle = {0};
-  if (inst_.scene->world != nullptr) {
-    /* Detect world update before overriding it. */
-    wo_handle = inst_.sync.sync_world(*inst_.scene->world);
-    has_update = wo_handle.recalc != 0;
-  }
+  WorldHandle wo_handle = {inst_.scene->world ? inst_.get_recalc_flags(*inst_.scene->world) : 0};
+  /* Detect world update before overriding it. */
+  has_update = wo_handle.recalc != 0;
 
   bool wait_ready = true;  // TODO !inst_.is_image_render;
 
@@ -116,6 +127,10 @@ void World::sync()
     has_update = true;
   }
 
+  if (has_update || sun_threshold() <= 0.0f) {
+    sunlight_clear();
+  }
+
   inst_.light_probes.sync_world(bl_world, has_update);
 
   if (inst_.is_viewport() && has_update) {
@@ -138,7 +153,7 @@ void World::sync()
   is_ready_ = true;
   uses_scene_time_ |= GPU_material_is_time_dependent(gpumat);
 
-  inst_.manager->register_layer_attributes(gpumat);
+  inst_.manager->register_material_resources(gpumat);
 
   float opacity = inst_.use_studio_light() ? lookdev_world_.background_opacity_get() :
                                              inst_.film.background_opacity_get();
@@ -164,6 +179,7 @@ void World::sync_volume(const WorldHandle &world_handle, bool wait_ready)
   bool had_volume = has_volume_;
 
   if (gpumat && (GPU_material_status(gpumat) == GPU_MAT_SUCCESS)) {
+    inst_.manager->register_material_resources(gpumat);
     has_volume_ = GPU_material_has_volume_output(gpumat);
     has_volume_scatter_ = GPU_material_flag_get(gpumat, GPU_MATFLAG_VOLUME_SCATTER);
     has_volume_absorption_ = GPU_material_flag_get(gpumat, GPU_MATFLAG_VOLUME_ABSORPTION);

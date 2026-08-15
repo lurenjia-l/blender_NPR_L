@@ -22,11 +22,14 @@
 #pragma once
 
 #include <memory>
+#include <string>
 
 #include "DNA_light_types.h"
 
 #include "DRW_gpu_wrapper.hh"
 
+#include "BLI_map.hh"
+#include "BLI_span.hh"
 #include "BLI_vector.hh"
 
 #include "eevee_camera.hh"
@@ -34,6 +37,7 @@
 #include "eevee_lightprobe_shared.hh"
 #include "eevee_sampling.hh"
 #include "eevee_sync.hh"
+#include "eevee_telemetry.hh"
 
 namespace blender::eevee {
 
@@ -170,6 +174,8 @@ class LightModule {
   int local_lights_len_ = 0;
   /** Sun plus local lights count for convenience. */
   int lights_len_ = 0;
+  Map<ObjectKey, std::string> light_names_;
+  Vector<TelemetryShadowLightCost> shadow_light_costs_;
 
   /**
    * Light Culling
@@ -211,7 +217,6 @@ class LightModule {
   bool light_shader_valid_ = false;
   bool front_light_shader_valid_ = false;
   bool uniform_light_shader_valid_ = false;
-  bool uniform_light_shader_evaluated_ = false;
   bool front_light_shader_missing_prepass_reported_ = false;
   bool front_light_shader_needed_ = false;
   bool volume_light_shader_valid_ = false;
@@ -236,6 +241,8 @@ class LightModule {
 
   /** Update light on the GPU after culling. Ran for each sample. */
   PassSimple update_ps_ = {"LightUpdate"};
+  /** Draw camera-visible light shapes. */
+  PassSimple shape_display_ps_ = {"Light.ShapeDisplay"};
 
   /** Debug Culling visualization. */
   PassSimple debug_draw_ps_ = {"LightCulling.Debug"};
@@ -245,7 +252,7 @@ class LightModule {
   ~LightModule();
 
   void begin_sync();
-  void sync_light(const Object *ob, ObjectHandle &handle);
+  void sync_light(const ObjectRef &ob_ref);
   void end_sync();
   void sync_render_extent(const int2 render_extent);
 
@@ -267,11 +274,18 @@ class LightModule {
                                  draw::StorageBuffer<CaptureInfoData> &capture_info_buf,
                                  uint surfel_len);
 
+  void shape_display_draw(View &view, gpu::FrameBuffer *view_fb);
   void debug_draw(View &view, gpu::FrameBuffer *view_fb);
 
   int light_count() const
   {
     return lights_len_;
+  }
+
+  Span<const TelemetryShadowLightCost> shadow_light_costs() const
+  {
+    return Span<const TelemetryShadowLightCost>(shadow_light_costs_.data(),
+                                                shadow_light_costs_.size());
   }
 
   bool has_time_dependent_light_shaders() const
@@ -305,8 +319,10 @@ class LightModule {
 
   template<typename PassType> void bind_light_shader_resources(PassType &pass)
   {
-    pass.bind_texture(LIGHT_SHADER_TEX_SLOT, &light_shader_tx_);
-    pass.bind_ssbo(LIGHT_SHADER_INDEX_BUF_SLOT, &light_shader_index_buf_);
+    /* Deferred direct-light eval reuses the prepass based cache. The GBuffer cache path is not
+     * stable across the 5.2 framebuffer/resource-table transition. */
+    pass.bind_texture(LIGHT_SHADER_TEX_SLOT, &front_light_shader_tx_);
+    pass.bind_ssbo(LIGHT_SHADER_INDEX_BUF_SLOT, &front_light_shader_index_buf_);
     pass.bind_ssbo(LIGHT_SHADER_UNIFORM_BUF_SLOT, &uniform_light_shader_buf_);
   }
 
@@ -351,10 +367,12 @@ class LightModule {
   void uniform_light_shader_pass_sync();
   void volume_light_shader_pass_sync(const int3 grid_size);
   void surfel_light_shader_pass_sync(uint surfel_len);
+  void shape_display_pass_sync();
   void debug_pass_sync();
   void culling_extent_sync(const int2 render_extent);
 
   void add_world_sun_light(const ObjectKey &key, bool use_diffuse, bool use_glossy);
+  void update_shadow_light_costs();
   void disable_point_dependent_front_light_shader_indices();
 };
 

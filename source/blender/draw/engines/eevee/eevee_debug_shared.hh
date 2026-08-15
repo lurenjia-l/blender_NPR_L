@@ -54,6 +54,10 @@ enum [[host_shared]] eDebugMode : uint32_t {
    */
   DEBUG_SHADOW_TILEMAP_RANDOM_COLOR = 13u,
   /**
+   * Show random color for each tile. Verify distribution and LOD transitions.
+   */
+  DEBUG_SHADOW_ATOMIC_COST = 17u,
+  /**
    * Show storage cost of each pixel in the gbuffer.
    */
   DEBUG_GBUFFER_STORAGE = 14u,
@@ -65,6 +69,11 @@ enum [[host_shared]] eDebugMode : uint32_t {
    * Color different buffers of the depth of field.
    */
   DEBUG_DOF_PLANES = 16u,
+  /**
+   * Show the effective shadow LOD selected for the active light.
+   * This is selected by the viewport overlay, not by `G.debug_value`.
+   */
+  DEBUG_SHADOW_LOD = 18u,
 };
 
 #ifndef GPU_SHADER

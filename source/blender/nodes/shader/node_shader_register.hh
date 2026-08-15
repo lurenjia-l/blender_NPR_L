@@ -7,6 +7,7 @@
 namespace blender {
 
 void register_node_tree_type_sh();
+void register_node_type_sh_filter_graph_input();
 
 void register_node_type_sh_group();
 
@@ -84,7 +85,6 @@ void register_node_type_sh_portal_in();
 void register_node_type_sh_portal_out();
 void register_node_type_sh_render_texture();
 void register_node_type_sh_render_info();
-void register_node_type_sh_scene_time();
 void register_node_type_sh_world_environment();
 void register_node_type_sh_light_probe_color();
 void register_node_type_sh_world_to_tangent();
@@ -111,6 +111,7 @@ void register_node_type_sh_rgb();
 void register_node_type_sh_rgbtobw();
 void register_node_type_sh_screen_derivative();
 void register_node_type_sh_script();
+void register_node_type_sh_script_expression();
 void register_node_type_sh_sepcolor();
 void register_node_type_sh_sepxyz();
 void register_node_type_sh_shadertorgb();
@@ -150,5 +151,11 @@ void register_node_type_sh_volume_scatter();
 void register_node_type_sh_volume_coefficients();
 void register_node_type_sh_wavelength();
 void register_node_type_sh_wireframe();
+
+void register_node_tree_type_eevee_filter_graph();
+void register_node_type_eevee_filter_graph_scene_color();
+void register_node_type_eevee_filter_graph_aov_input();
+void register_node_type_eevee_filter_graph_filter_material();
+void register_node_type_eevee_filter_graph_stage_output();
 
 }  // namespace blender

@@ -23,20 +23,24 @@ class OutlineModule {
 
   PassSimple detect_ps_ = {"Outline.Detect"};
   PassMain freestyle_edge_ps_ = {"Outline.FreestyleEdge"};
+  PassSimple factor_blur_ps_ = {"Outline.FactorBlur"};
   PassSimple jfa_init_ps_ = {"Outline.JFA.Init"};
   PassSimple jfa_step_ps_ = {"Outline.JFA.Step"};
   PassSimple resolve_ps_ = {"Outline.Resolve"};
 
   Framebuffer detect_fb_ = {"Outline.Detect.FB"};
+  Framebuffer factor_blur_fb_ = {"Outline.FactorBlur.FB"};
   Framebuffer jfa_init_fb_ = {"Outline.JFA.Init.FB"};
   Framebuffer resolve_fb_ = {"Outline.Resolve.FB"};
   Framebuffer occlusion_fb_ = {"Outline.Occlusion.FB"};
 
-  TextureFromPool edge_seed_tx_ = {"Outline.EdgeSeed"};
+  SwapChain<TextureFromPool, 2> edge_seed_tx_;
   TextureFromPool resolved_outline_tx_ = {"Outline.Resolved"};
   TextureFromPool resolved_depth_tx_ = {"Outline.ResolvedDepth"};
   TextureFromPool resolved_velocity_tx_ = {"Outline.ResolvedVelocity"};
   TextureFromPool occlusion_depth_tx_ = {"Outline.OcclusionDepth"};
+  gpu::Texture *outline_occlusion_depth_tx_ = nullptr;
+  int use_outline_occlusion_depth_ = 0;
   SwapChain<TextureFromPool, 2> jfa_tx_;
 
   int jfa_step_size_ = 1;

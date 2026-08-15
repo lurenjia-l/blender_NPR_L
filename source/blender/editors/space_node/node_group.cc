@@ -7,13 +7,17 @@
  */
 
 #include <cstdlib>
+#include <climits>
 
 #include "MEM_guardedalloc.h"
 
+#include "DNA_material_types.h"
 #include "DNA_node_types.h"
+#include "DNA_scene_types.h"
 
 #include "BLI_math_vector.h"
 #include "BLI_math_vector_types.hh"
+#include "BLI_listbase.h"
 #include "BLI_string.h"
 #include "BLI_string_utf8.h"
 #include "BLI_vector.hh"
@@ -61,6 +65,102 @@
 
 namespace blender::ed::space_node {
 
+static Material *filter_pass_node_material_get(const bNode &node)
+{
+  if (!STREQ(node.idname, "EeveeFilterGraphNodeFilterMaterial")) {
+    return nullptr;
+  }
+  if (node.id == nullptr || GS(node.id->name) != ID_MA) {
+    return nullptr;
+  }
+  Material *material = reinterpret_cast<Material *>(node.id);
+  return material->nodetree != nullptr ? material : nullptr;
+}
+
+static bNode *filter_pass_node_find_by_identifier(SpaceNode &snode, const int identifier)
+{
+  if (identifier == 0 || snode.edittree == nullptr ||
+      !STREQ(snode.edittree->idname, "EeveeFilterGraphNodeTree"))
+  {
+    return nullptr;
+  }
+  for (bNode *node : snode.edittree->all_nodes()) {
+    if (node->identifier == identifier &&
+        STREQ(node->idname, "EeveeFilterGraphNodeFilterMaterial"))
+    {
+      return node;
+    }
+  }
+  return nullptr;
+}
+
+static bool node_filter_material_context_poll(const SpaceNode &snode)
+{
+  if (snode.shaderfrom != SNODE_SHADER_FILTER) {
+    return false;
+  }
+  if (STREQ(snode.tree_idname, "ShaderNodeTree")) {
+    return true;
+  }
+  return snode.edittree != nullptr && STREQ(snode.edittree->idname, "ShaderNodeTree");
+}
+
+static wmOperatorStatus node_filter_graph_return_exec(bContext *C)
+{
+  SpaceNode *snode = CTX_wm_space_node(C);
+  ARegion *region = CTX_wm_region(C);
+  Scene *scene = CTX_data_scene(C);
+  if (snode == nullptr || scene == nullptr || scene->eevee.filter_graph == nullptr) {
+    return OPERATOR_CANCELLED;
+  }
+
+  STRNCPY_UTF8(snode->tree_idname, "EeveeFilterGraphNodeTree");
+  snode->shaderfrom = SNODE_SHADER_OBJECT;
+  ED_node_tree_start(region, snode, scene->eevee.filter_graph, &scene->id, nullptr);
+
+  WM_event_add_notifier(C, NC_SCENE | ND_NODES, nullptr);
+  WM_event_add_notifier(C, NC_NODE | ND_NODE_GIZMO, nullptr);
+  return OPERATOR_FINISHED;
+}
+
+static bool node_filter_graph_return_poll(bContext *C)
+{
+  SpaceNode *snode = CTX_wm_space_node(C);
+  Scene *scene = CTX_data_scene(C);
+  if (snode == nullptr || scene == nullptr || scene->eevee.filter_graph == nullptr) {
+    return false;
+  }
+  return node_filter_material_context_poll(*snode);
+}
+
+static wmOperatorStatus node_filter_pass_edit_material_exec(bContext *C, bNode &node)
+{
+  Material *material = filter_pass_node_material_get(node);
+  if (material == nullptr) {
+    return OPERATOR_PASS_THROUGH;
+  }
+
+  SpaceNode *snode = CTX_wm_space_node(C);
+  ARegion *region = CTX_wm_region(C);
+  if (snode == nullptr) {
+    return OPERATOR_CANCELLED;
+  }
+
+  ED_preview_kill_jobs(CTX_wm_manager(C), CTX_data_main(C));
+  STRNCPY_UTF8(snode->tree_idname, "ShaderNodeTree");
+  snode->shaderfrom = SNODE_SHADER_FILTER;
+  ED_node_tree_push(region, snode, material->nodetree, &node);
+  snode->id = &material->id;
+  snode->from = nullptr;
+  bNodeTreePath *path = static_cast<bNodeTreePath *>(snode->treepath.last);
+  if (path != nullptr) {
+    STRNCPY_UTF8(path->display_name, material->id.name + 2);
+  }
+  WM_event_add_notifier(C, NC_MATERIAL | ND_NODES, &material->id);
+  WM_event_add_notifier(C, NC_NODE | ND_NODE_GIZMO, nullptr);
+  return OPERATOR_FINISHED;
+}
+
 /* -------------------------------------------------------------------- */
 /** \name Local Utilities
  * \{ */
@@ -77,7 +177,8 @@ static bool node_group_operator_active_poll(bContext *C)
                  "ShaderNodeTree",
                  "CompositorNodeTree",
                  "TextureNodeTree",
-                 "GeometryNodeTree"))
+                 "GeometryNodeTree",
+                 "EeveeFilterGraphNodeTree"))
     {
       return true;
     }
@@ -92,7 +193,8 @@ static bool node_group_edit_poll(bContext *C)
   }
 
   SpaceNode *snode = CTX_wm_space_node(C);
-  return snode != nullptr && ED_node_is_shader(snode) && snode->shaderfrom == SNODE_SHADER_NPR;
+  return snode != nullptr && ED_node_is_shader(snode) &&
+         ELEM(snode->shaderfrom, SNODE_SHADER_NPR, SNODE_SHADER_FILTER);
 }
 
 static bool node_group_operator_editable(bContext *C)
@@ -118,7 +220,7 @@ static StringRef group_ntree_idname(bContext *C)
   return snode->tree_idname;
 }
 
-StringRef node_group_idname(const bContext *C)
+UString node_group_idname(const bContext *C)
 {
   SpaceNode *snode = CTX_wm_space_node(C);
 
@@ -135,10 +237,10 @@ StringRef node_group_idname(const bContext *C)
     return ntreeType_Geometry->group_idname;
   }
 
-  return "";
+  return ""_ustr;
 }
 
-static bNode *node_group_get_active(bContext *C, const StringRef node_idname)
+static bNode *node_group_get_active(bContext *C, const UString node_idname)
 {
   SpaceNode *snode = CTX_wm_space_node(C);
   if (snode->edittree == nullptr) {
@@ -162,8 +264,26 @@ static wmOperatorStatus node_group_edit_exec(bContext *C, wmOperator *op)
 {
   SpaceNode *snode = CTX_wm_space_node(C);
   ARegion *region = CTX_wm_region(C);
-  const StringRef node_idname = node_group_idname(C);
+  const UString node_idname = node_group_idname(C);
   const bool exit = RNA_boolean_get(op->ptr, "exit");
+
+  if (!exit && snode != nullptr && snode->edittree != nullptr &&
+      STREQ(snode->edittree->idname, "EeveeFilterGraphNodeTree"))
+  {
+    bNode *node = bke::node_get_active(*snode->edittree);
+    if (node != nullptr && STREQ(node->idname, "EeveeFilterGraphNodeFilterMaterial")) {
+      return node_filter_pass_edit_material_exec(C, *node);
+    }
+    return OPERATOR_CANCELLED;
+  }
+
+  if (exit && snode != nullptr && node_filter_material_context_poll(*snode))
+  {
+    wmOperatorStatus status = node_filter_graph_return_exec(C);
+    if (status == OPERATOR_FINISHED) {
+      return status;
+    }
+  }
 
   ED_preview_kill_jobs(CTX_wm_manager(C), CTX_data_main(C));
 
@@ -236,9 +356,19 @@ static wmOperatorStatus node_group_enter_exit_invoke(bContext *C,
   ui::view2d_region_to_view(&region.v2d, event->mval[0], event->mval[1], &cursor.x, &cursor.y);
   bNode *node = node_under_mouse_get(snode, cursor);
 
+  if (STREQ(snode.tree_idname, "EeveeFilterGraphNodeTree")) {
+    if (node != nullptr && STREQ(node->idname, "EeveeFilterGraphNodeFilterMaterial")) {
+      return node_filter_pass_edit_material_exec(C, *node);
+    }
+    return OPERATOR_PASS_THROUGH;
+  }
+
   if (!node || node->is_frame()) {
     ED_node_tree_pop(&region, &snode);
     return OPERATOR_FINISHED;
+  }
+  if (STREQ(node->idname, "EeveeFilterGraphNodeFilterMaterial")) {
+    return node_filter_pass_edit_material_exec(C, *node);
   }
   if (!node->is_group()) {
     return OPERATOR_PASS_THROUGH;
@@ -269,14 +399,94 @@ void NODE_OT_group_enter_exit(wmOperatorType *ot)
 /** \} */
 
 /* -------------------------------------------------------------------- */
+/** \name Edit Filter Pass Material Operator
+ * \{ */
+
+static bool node_filter_pass_edit_material_poll(bContext *C)
+{
+  SpaceNode *snode = CTX_wm_space_node(C);
+  if (snode == nullptr || snode->edittree == nullptr) {
+    return false;
+  }
+  if (STREQ(snode->edittree->idname, "EeveeFilterGraphNodeTree")) {
+    return true;
+  }
+  if (!ED_operator_node_active(C)) {
+    return false;
+  }
+  bNode *node = bke::node_get_active(*snode->edittree);
+  return node != nullptr && filter_pass_node_material_get(*node) != nullptr;
+}
+
+static wmOperatorStatus node_filter_pass_edit_material_operator_exec(bContext *C,
+                                                                     wmOperator *op)
+{
+  SpaceNode *snode = CTX_wm_space_node(C);
+  if (snode == nullptr || snode->edittree == nullptr) {
+    return OPERATOR_CANCELLED;
+  }
+  const int node_identifier = RNA_int_get(op->ptr, "node_identifier");
+  bNode *node = filter_pass_node_find_by_identifier(*snode, node_identifier);
+  if (node == nullptr) {
+    node = bke::node_get_active(*snode->edittree);
+  }
+  if (node == nullptr) {
+    return OPERATOR_CANCELLED;
+  }
+  return node_filter_pass_edit_material_exec(C, *node);
+}
+
+void NODE_OT_filter_pass_edit_material(wmOperatorType *ot)
+{
+  ot->name = "Edit Filter Pass Material";
+  ot->description = "Edit the filter material used by the active Filter Pass node";
+  ot->idname = "NODE_OT_filter_pass_edit_material";
+
+  ot->exec = node_filter_pass_edit_material_operator_exec;
+  ot->poll = node_filter_pass_edit_material_poll;
+
+  ot->flag = OPTYPE_REGISTER | OPTYPE_UNDO;
+
+  PropertyRNA *prop = RNA_def_int(
+      ot->srna, "node_identifier", 0, 0, INT_MAX, "Node Identifier", "", 0, INT_MAX);
+  RNA_def_property_flag(prop, PROP_SKIP_SAVE);
+}
+
+/** \} */
+
+/* -------------------------------------------------------------------- */
+/** \name Return to Filter Graph Operator
+ * \{ */
+
+static wmOperatorStatus node_filter_graph_return_operator_exec(bContext *C, wmOperator * /*op*/)
+{
+  return node_filter_graph_return_exec(C);
+}
+
+void NODE_OT_filter_graph_return(wmOperatorType *ot)
+{
+  ot->name = "Return to Eevee Filter Graph";
+  ot->description = "Return from a filter material node tree to the scene Eevee Filter Graph";
+  ot->idname = "NODE_OT_filter_graph_return";
+
+  ot->exec = node_filter_graph_return_operator_exec;
+  ot->poll = node_filter_graph_return_poll;
+
+  ot->flag = OPTYPE_REGISTER | OPTYPE_UNDO;
+}
+
+/** \} */
+
+/* -------------------------------------------------------------------- */
 /** \name Ungroup Operator
  * \{ */
 
 /**
  * \return True if successful.
  */
-static void node_group_ungroup(Main &bmain, bNodeTree &ntree, bNode &group_node)
+static void node_group_ungroup(bContext &C, bNodeTree &ntree, bNode &group_node)
 {
+  Main &bmain = *CTX_data_main(&C);
   NodeSetInterfaceParams params;
   params.skip_hidden = false;
 
@@ -293,7 +503,8 @@ static void node_group_ungroup(Main &bmain, bNodeTree &ntree, bNode &group_node)
         return true;
       },
       ntree);
-  connect_copied_nodes_to_external_sockets(ngroup, copied_nodes, io_mapping);
+  const InterfaceProxyNodes proxy_nodes = connect_copied_nodes_to_external_sockets(
+      C, ngroup, copied_nodes, io_mapping, &group_node);
 
   /* Center nodes on the bounds of the original group node. */
   if (const std::optional<Bounds<float2>> bounds = node_location_bounds(Span{&group_node})) {
@@ -302,6 +513,19 @@ static void node_group_ungroup(Main &bmain, bNodeTree &ntree, bNode &group_node)
       node->location[0] += center[0];
       node->location[1] += center[1];
     }
+    for (bNode *node : proxy_nodes.values()) {
+      node->location[0] += center[0];
+      node->location[1] += center[1];
+    }
+  }
+  /* Attach to the same parent as the group node. */
+  if (group_node.parent) {
+    for (bNode *node : copied_nodes.node_map().values()) {
+      node->parent = group_node.parent;
+    }
+    for (bNode *node : proxy_nodes.values()) {
+      node->parent = group_node.parent;
+    }
   }
 
   update_nested_node_refs_after_ungroup(ntree, group_node, copied_nodes);
@@ -309,8 +533,11 @@ static void node_group_ungroup(Main &bmain, bNodeTree &ntree, bNode &group_node)
   /* Delete the original group instance. */
   bke::node_remove_node(&bmain, ntree, group_node, true);
 
-  /* Select ungrouped nodes*/
+  /* Select ungrouped nodes. */
   for (bNode *node : copied_nodes.node_map().values()) {
+    bke::node_set_selected(*node, true);
+  }
+  for (bNode *node : proxy_nodes.values()) {
     bke::node_set_selected(*node, true);
   }
 }
@@ -319,7 +546,7 @@ static wmOperatorStatus node_group_ungroup_exec(bContext *C, wmOperator * /*op*/
 {
   Main *bmain = CTX_data_main(C);
   SpaceNode *snode = CTX_wm_space_node(C);
-  const StringRef node_idname = node_group_idname(C);
+  const UString node_idname = node_group_idname(C);
 
   ED_preview_kill_jobs(CTX_wm_manager(C), bmain);
 
@@ -339,8 +566,9 @@ static wmOperatorStatus node_group_ungroup_exec(bContext *C, wmOperator * /*op*/
 
   node_deselect_all(*snode->edittree);
   for (bNode *node : nodes_to_ungroup) {
-    node_group_ungroup(*bmain, *snode->edittree, *node);
+    node_group_ungroup(*C, *snode->edittree, *node);
   }
+  WM_event_handling_break(*C);
   BKE_main_ensure_invariants(*CTX_data_main(C));
   return OPERATOR_FINISHED;
 }
@@ -603,13 +831,9 @@ static void node_group_make_insert_selected(const bContext &C,
   params.skip_hidden = true;
   /* Expose only connected sockets if there is more than one node. */
   params.skip_unconnected = (nodes.size() > 1);
-  /* TODO Shared external connection will only create a single interface socket, but its type is
-   * based on the first internal socket. This creates potential conversion conflicts.
-   * (see also NodeSetInterfaceBuilder::expose_socket). */
+  /* Share external connections if a socket has multiple links. */
   params.use_unique_input = false;
-  /* TODO Unique output interface sockets are redundant and all use the same internal socket
-   * template. (see also NodeSetInterfaceBuilder::expose_socket). */
-  params.use_unique_output = true;
+  params.use_unique_output = false;
   const NodeTreeInterfaceMapping io_mapping = build_node_set_interface(
       params, ntree, nodes, group);
 
@@ -636,7 +860,7 @@ static void node_group_make_insert_selected(const bContext &C,
 static bNode *node_group_make_from_nodes(const bContext &C,
                                          bNodeTree &ntree,
                                          const Span<bNode *> nodes_to_group,
-                                         const StringRef ntype,
+                                         const UString ntype,
                                          const StringRef ntreetype)
 {
   Main *bmain = CTX_data_main(&C);
@@ -650,8 +874,11 @@ static bNode *node_group_make_from_nodes(const bContext &C,
   gnode->id = id_cast<ID *>(ngroup);
 
   if (const std::optional<Bounds<float2>> bounds = node_location_bounds(nodes_to_group)) {
-    gnode->location[0] = bounds->center()[0];
-    gnode->location[1] = bounds->center()[1];
+    gnode->location[0] = nearest_node_grid_coord(bounds->center()[0]);
+    gnode->location[1] = nearest_node_grid_coord(bounds->center()[1]);
+  }
+  if (bNode *parent = ed::space_node::find_common_parent_node(nodes_to_group)) {
+    gnode->parent = parent;
   }
 
   node_group_make_insert_selected(C, ntree, gnode, nodes_to_group);
@@ -662,13 +889,16 @@ static bNode *node_group_make_from_nodes(const bContext &C,
 static bNode *node_group_make_from_node_declaration(bContext &C,
                                                     bNodeTree &ntree,
                                                     bNode &src_node,
-                                                    const StringRef node_idname)
+                                                    const UString node_idname)
 {
   Main &bmain = *CTX_data_main(&C);
 
   bNodeTree *wrapper_group = bke::node_tree_add_tree(
       &bmain, bke::node_label(ntree, src_node), ntree.idname);
   wrapper_group->color_tag = int(bke::node_color_tag(src_node));
+  if (!src_node.is_reroute()) {
+    wrapper_group->default_group_node_width = src_node.width;
+  }
 
   NodeSetInterfaceParams params;
   /* Hidden sockets are exposed but hidden on the group node instance. */
@@ -694,7 +924,10 @@ static bNode *node_group_make_from_node_declaration(bContext &C,
 
   /* Position node exactly where the old node was. */
   gnode->parent = src_node.parent;
-  gnode->width = std::max<float>(src_node.width, GROUP_NODE_MIN_WIDTH);
+
+  if (!src_node.is_reroute()) {
+    gnode->width = std::max<float>(src_node.width, bke::NodeWidth::GroupMin);
+  }
   copy_v2_v2(gnode->location, src_node.location);
 
   BKE_main_ensure_invariants(bmain);
@@ -724,7 +957,7 @@ static wmOperatorStatus node_group_make_exec(bContext *C, wmOperator *op)
   SpaceNode &snode = *CTX_wm_space_node(C);
   bNodeTree &ntree = *snode.edittree;
   const StringRef ntree_idname = group_ntree_idname(C);
-  const StringRef node_idname = node_group_idname(C);
+  const UString node_idname = node_group_idname(C);
   Main *bmain = CTX_data_main(C);
 
   ED_preview_kill_jobs(CTX_wm_manager(C), CTX_data_main(C));
@@ -753,7 +986,7 @@ static wmOperatorStatus node_group_make_exec(bContext *C, wmOperator *op)
   }
 
   WM_event_add_notifier(C, NC_NODE | NA_ADDED, nullptr);
-
+  WM_event_handling_break(*C);
   /* We broke relations in node tree, need to rebuild them in the graphs. */
   DEG_relations_tag_update(bmain);
 
@@ -786,7 +1019,7 @@ static wmOperatorStatus node_group_insert_exec(bContext *C, wmOperator *op)
   SpaceNode *snode = CTX_wm_space_node(C);
   ARegion *region = CTX_wm_region(C);
   bNodeTree *ntree = snode->edittree;
-  const StringRef node_idname = node_group_idname(C);
+  const UString node_idname = node_group_idname(C);
 
   ED_preview_kill_jobs(CTX_wm_manager(C), CTX_data_main(C));
 

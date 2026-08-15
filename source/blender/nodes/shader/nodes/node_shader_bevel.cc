@@ -13,9 +13,9 @@ namespace nodes::node_shader_bevel_cc {
 
 static void node_declare(NodeDeclarationBuilder &b)
 {
-  b.add_input<decl::Float>("Radius").default_value(0.05f).min(0.0f).max(1000.0f);
-  b.add_input<decl::Vector>("Normal").hide_value();
-  b.add_output<decl::Vector>("Normal");
+  b.add_input<decl::Float>("Radius"_ustr).default_value(0.05f).min(0.0f).max(1000.0f);
+  b.add_input<decl::Vector>("Normal"_ustr).hide_value();
+  b.add_output<decl::Vector>("Normal"_ustr);
 }
 
 static void node_shader_buts_bevel(ui::Layout &layout, bContext * /*C*/, PointerRNA *ptr)
@@ -39,6 +39,7 @@ static int gpu_shader_bevel(GPUMaterial *mat,
   }
 
   GPU_material_flag_set(mat, GPU_MATFLAG_RAYCAST);
+  GPU_material_hiz_data_set(mat);
 
   const float f_samples = (node->custom1 > 0) ? float(node->custom1) : 1.0f;
   return GPU_stack_link(mat, node, "node_bevel", in, out, GPU_constant(&f_samples));
@@ -62,7 +63,7 @@ void register_node_type_sh_bevel()
 
   static bke::bNodeType ntype;
 
-  sh_node_type_base(&ntype, "ShaderNodeBevel", SH_NODE_BEVEL);
+  sh_node_type_base(&ntype, "ShaderNodeBevel"_ustr, SH_NODE_BEVEL);
   ntype.ui_name = "Bevel";
   ntype.ui_description =
       "Generates normals with round corners.\nCycles traces true bevel rays; Eevee uses a "

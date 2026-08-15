@@ -64,20 +64,28 @@ namespace blender::eevee
 {
 
   using UniformDataBuf = draw::UniformBuffer<UniformData>;
+  using PipelineInfoBuf = draw::UniformBuffer<PipelineInfoData>;
+  using RaytraceDataBuf = draw::UniformBuffer<RayTraceData>;
 
   /* Combines data from several modules to avoid wasting binding slots. */
   struct UniformDataModule
   {
     UniformDataBuf data = { "UniformDataBuf" };
+    PipelineInfoBuf pipeline = { "PipelineInfoBuf" };
+    RaytraceDataBuf raytrace = { "RaytraceDataBuf" };
 
     void push_update()
     {
       data.push_update();
+      pipeline.push_update();
+      raytrace.push_update();
     }
 
     template<typename PassType> void bind_resources(PassType& pass)
     {
       pass.bind_ubo(UNIFORM_BUF_SLOT, &data);
+      pass.bind_ubo(PIPELINE_BUF_SLOT, &pipeline);
+      pass.bind_ubo(RAYTRACE_BUF_SLOT, &raytrace);
     }
   };
 
@@ -98,7 +106,8 @@ namespace blender::eevee
 
     uint64_t depsgraph_last_update_ = 0;
     bool overlays_enabled_ = false;
-    bool profiler_enabled_ = false;
+    bool shadow_lod_overlay_ = false;
+    float shadow_lod_overlay_opacity_ = 0.7f;
     bool skip_render_ = false;
     bool last_viewport_scene_time_valid_ = false;
     float last_viewport_scene_time_ = 0.0f;
@@ -195,20 +204,22 @@ namespace blender::eevee
     bool use_curves = true;
     bool use_volumes = true;
 
+    GPUSamplerFiltering anisotropic_filtering = GPU_SAMPLER_FILTERING_DEFAULT;
+
     /** Debug mode from debug value. */
     eDebugMode debug_mode = eDebugMode::DEBUG_NONE;
 
   public:
-    Instance()
+    explicit Instance(std::shared_ptr<TelemetrySourceState> telemetry_source = nullptr)
       : shaders(*ShaderModule::module_get()),
       sync(*this),
       materials(*this),
-      subsurface(*this, uniform_data.data.subsurface),
-      pipelines(*this, uniform_data.data.pipeline),
+      subsurface(*this),
+      pipelines(*this, uniform_data.pipeline),
       shadows(*this, uniform_data.data.shadow),
       lights(*this),
       ambient_occlusion(*this, uniform_data.data.ao),
-      raytracing(*this, uniform_data.data.raytrace),
+      raytracing(*this, uniform_data.raytrace),
       velocity(*this),
       motion_blur(*this),
       depth_of_field(*this),
@@ -232,14 +243,17 @@ namespace blender::eevee
       volume_probes(*this),
       light_probes(*this),
       volume(*this, uniform_data.data.volumes),
-      telemetry(*this)
+       telemetry(*this, std::move(telemetry_source))
     {};
-    ~Instance() {};
+    ~Instance() override {};
 
     StringRefNull name_get() final
     {
       return "EEVEE";
     }
+
+    bool performance_capture_requested(const DRWContext &draw_ctx) const final;
+    void performance_frame_end(const DrawPerformanceMetrics &metrics) final;
 
     /* Render & Viewport. */
     /* TODO(fclem): Split for clarity. */
@@ -286,6 +300,7 @@ namespace blender::eevee
     /* Render. */
 
     void render_sync();
+    void wait_for_material_passes();
     void render_frame(RenderEngine* engine, RenderLayer* render_layer, const char* view_name);
     void store_metadata(RenderResult* render_result);
 
@@ -355,7 +370,12 @@ namespace blender::eevee
 
     bool is_viewport() const
     {
-      return render == nullptr && !is_baking();
+      return render == nullptr && !is_baking() && draw_ctx != nullptr &&
+             ELEM(draw_ctx->mode,
+                  DRWContext::VIEWPORT,
+                  DRWContext::VIEWPORT_XR,
+                  DRWContext::VIEWPORT_OFFSCREEN,
+                  DRWContext::VIEWPORT_RENDER);
     }
 
     bool is_baking() const
@@ -372,6 +392,16 @@ namespace blender::eevee
     bool overlays_enabled() const
     {
       return overlays_enabled_;
+    }
+
+    bool shadow_lod_overlay_enabled() const
+    {
+      return shadow_lod_overlay_;
+    }
+
+    float shadow_lod_overlay_opacity() const
+    {
+      return shadow_lod_overlay_opacity_;
     }
 
     /** True if the grease pencil engine might be running. */
@@ -404,14 +434,14 @@ namespace blender::eevee
         ((v3d->shading.type == OB_MATERIAL) && (v3d->overlay.flag & V3D_OVERLAY_LOOK_DEV));
     }
 
-    int get_recalc_flags(const ObjectRef& ob_ref)
+    uint get_recalc_flags(const ObjectRef& ob_ref)
     {
       return ob_ref.recalc_flags(depsgraph_last_update_);
     }
 
-    int get_recalc_flags(const blender::World& world)
+    uint get_recalc_flags(const blender::World& world)
     {
-      return world.last_update > depsgraph_last_update_ ? int(ID_RECALC_SHADING) : 0;
+      return world.last_update > depsgraph_last_update_ ? uint(ID_RECALC_SHADING) : 0;
     }
 
   private:

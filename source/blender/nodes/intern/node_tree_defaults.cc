@@ -79,10 +79,11 @@ static bool color_socket_is_default_white(const bNodeSocket &socket)
 static bool light_shader_output_inputs_are_unlinked_defaults(bNodeTree &ntree,
                                                              bNode &light_shader_output)
 {
-  const bNodeSocket *color = bke::node_find_socket(light_shader_output, SOCK_IN, "Color");
-  const bNodeSocket *intensity = bke::node_find_socket(light_shader_output, SOCK_IN, "Intensity");
+  const bNodeSocket *color = bke::node_find_socket(light_shader_output, SOCK_IN, "Color"_ustr);
+  const bNodeSocket *intensity = bke::node_find_socket(
+      light_shader_output, SOCK_IN, "Intensity"_ustr);
   const bNodeSocket *attenuation = bke::node_find_socket(
-      light_shader_output, SOCK_IN, "Attenuation");
+      light_shader_output, SOCK_IN, "Attenuation"_ustr);
   return color != nullptr && intensity != nullptr && attenuation != nullptr &&
          !input_has_link(ntree, *color) && !input_has_link(ntree, *intensity) &&
          !input_has_link(ntree, *attenuation) && color_socket_is_default_white(*color) &&
@@ -92,8 +93,8 @@ static bool light_shader_output_inputs_are_unlinked_defaults(bNodeTree &ntree,
 static bool light_shader_default_nodes_link_socket(bNodeTree &ntree,
                                                    bNode &light_shader_info,
                                                    bNode &light_shader_output,
-                                                   const char *from_identifier,
-                                                   const char *to_identifier)
+                                                   UString from_identifier,
+                                                   UString to_identifier)
 {
   bNodeSocket *from_socket = bke::node_find_socket(light_shader_info, SOCK_OUT, from_identifier);
   bNodeSocket *to_socket = bke::node_find_socket(light_shader_output, SOCK_IN, to_identifier);
@@ -116,11 +117,15 @@ static void light_shader_default_nodes_link(bNodeTree &ntree,
   }
 
   r_changed |= light_shader_default_nodes_link_socket(
-      ntree, light_shader_info, light_shader_output, "Default Color", "Color");
+      ntree, light_shader_info, light_shader_output, "Default Color"_ustr, "Color"_ustr);
   r_changed |= light_shader_default_nodes_link_socket(
-      ntree, light_shader_info, light_shader_output, "Default Intensity", "Intensity");
+      ntree, light_shader_info, light_shader_output, "Default Intensity"_ustr, "Intensity"_ustr);
   r_changed |= light_shader_default_nodes_link_socket(
-      ntree, light_shader_info, light_shader_output, "Default Attenuation", "Attenuation");
+      ntree,
+      light_shader_info,
+      light_shader_output,
+      "Default Attenuation"_ustr,
+      "Attenuation"_ustr);
 }
 
 bool node_tree_light_shader_default_ensure(bNodeTree &ntree)
@@ -217,24 +222,24 @@ void node_tree_shader_default(const bContext *C, Main *bmain, ID *id)
       output = bke::node_add_static_node(nullptr, *ntree, SH_NODE_OUTPUT_WORLD);
       bke::node_add_link(*ntree,
                          *shader,
-                         *bke::node_find_socket(*shader, SOCK_OUT, "Background"),
+                         *bke::node_find_socket(*shader, SOCK_OUT, "Background"_ustr),
                          *output,
-                         *bke::node_find_socket(*output, SOCK_IN, "Surface"));
+                         *bke::node_find_socket(*output, SOCK_IN, "Surface"_ustr));
 
-      bNodeSocket *color_sock = bke::node_find_socket(*shader, SOCK_IN, "Color");
+      bNodeSocket *color_sock = bke::node_find_socket(*shader, SOCK_IN, "Color"_ustr);
       copy_v3_v3((reinterpret_cast<bNodeSocketValueRGBA *>(color_sock->default_value))->value,
                  &world->horr);
     }
     else {
       ntree = bke::node_tree_add_tree_embedded(
-          nullptr, id, "Shader Nodetree", ntreeType_Shader->idname);
+          nullptr, id, "Shader Nodetree", ntreeType_Shader->idname.ref());
       shader = bke::node_add_static_node(nullptr, *ntree, SH_NODE_EMISSION);
       output = bke::node_add_static_node(nullptr, *ntree, SH_NODE_OUTPUT_LIGHT);
       bke::node_add_link(*ntree,
                          *shader,
-                         *bke::node_find_socket(*shader, SOCK_OUT, "Emission"),
+                         *bke::node_find_socket(*shader, SOCK_OUT, "Emission"_ustr),
                          *output,
-                         *bke::node_find_socket(*output, SOCK_IN, "Surface"));
+                         *bke::node_find_socket(*output, SOCK_IN, "Surface"_ustr));
 
       node_tree_light_shader_default_ensure(*ntree);
     }
@@ -265,7 +270,7 @@ void node_tree_composit_default(const bContext *C, Scene *sce)
   }
 
   sce->compositing_node_group = bke::node_tree_add_tree(
-      bmain, DATA_("Compositor Nodes"), ntreeType_Composite->idname);
+      bmain, DATA_("Compositor Nodes"), ntreeType_Composite->idname.ref());
 
   node_tree_composit_default_init(C, sce->compositing_node_group);
 
@@ -275,14 +280,14 @@ void node_tree_composit_default(const bContext *C, Scene *sce)
 void node_tree_composit_default_init(const bContext *C, bNodeTree *ntree)
 {
   BLI_assert(ntree != nullptr && ntree->type == NTREE_COMPOSIT);
-  BLI_assert(BLI_listbase_count(&ntree->nodes) == 0);
+  BLI_assert(ntree->nodes.count() == 0);
 
   ntree->tree_interface.add_socket(
       DATA_("Image"), "", "NodeSocketColor", NODE_INTERFACE_SOCKET_INPUT, nullptr);
   ntree->tree_interface.add_socket(
       DATA_("Image"), "", "NodeSocketColor", NODE_INTERFACE_SOCKET_OUTPUT, nullptr);
 
-  bNode *composite = bke::node_add_node(C, *ntree, "NodeGroupOutput");
+  bNode *composite = bke::node_add_node(C, *ntree, "NodeGroupOutput"_ustr);
   composite->location[0] = 200.0f;
   /* The asset shelf is visible by default, so add a small offset to keep nodes centered in the
    * visible area.*/

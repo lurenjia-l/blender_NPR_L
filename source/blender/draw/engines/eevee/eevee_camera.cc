@@ -6,7 +6,7 @@
  * \ingroup eevee
  */
 
-#include "BLI_bounds.hh"
+#include "BKE_screen.hh"
 #include "BLI_math_matrix.hh"
 #include "BLI_rect.h"
 
@@ -22,7 +22,44 @@
 #include "eevee_camera.hh"
 #include "eevee_instance.hh"
 
+#include <algorithm>
+#include <cmath>
+
 namespace blender::eevee {
+
+static bool camera_data_projection_dimensions_valid(const bool is_perspective_camera,
+                                                    const float left,
+                                                    const float right,
+                                                    const float bottom,
+                                                    const float top,
+                                                    const float near,
+                                                    const float far)
+{
+  if (!std::isfinite(left) || !std::isfinite(right) || !std::isfinite(bottom) ||
+      !std::isfinite(top) || !std::isfinite(near) || !std::isfinite(far))
+  {
+    return false;
+  }
+
+  return !is_perspective_camera || (std::abs(near) > 1.0e-8f);
+}
+
+static void camera_data_projection_dimensions_fallback(const bool is_perspective_camera,
+                                                       const CameraData &data,
+                                                       float &left,
+                                                       float &right,
+                                                       float &bottom,
+                                                       float &top,
+                                                       float &near,
+                                                       float &far)
+{
+  near = std::max(std::abs(data.clip_near), 0.01f);
+  far = std::max(std::abs(data.clip_far), near + 1.0f);
+
+  const float half_size = is_perspective_camera ? near : 0.5f;
+  left = bottom = -half_size;
+  right = top = half_size;
+}
 
 static void camera_data_update_screen_diagonal(CameraData &data)
 {
@@ -30,9 +67,20 @@ static void camera_data_update_screen_diagonal(CameraData &data)
   projmat_dimensions(data.winmat.ptr(), &left, &right, &bottom, &top, &near, &far);
 
   const bool is_perspective_camera = data.type == CAMERA_PERSP;
-  float2 p0 = float2(left, bottom) / (is_perspective_camera ? -near : 1.0f);
-  float2 p1 = float2(right, top) / (is_perspective_camera ? -far : 1.0f);
+  if (!camera_data_projection_dimensions_valid(
+          is_perspective_camera, left, right, bottom, top, near, far))
+  {
+    camera_data_projection_dimensions_fallback(
+        is_perspective_camera, data, left, right, bottom, top, near, far);
+  }
+
+  const float depth = is_perspective_camera ? -near : 1.0f;
+  float2 p0 = float2(left, bottom) / depth;
+  float2 p1 = float2(right, top) / depth;
   data.screen_diagonal_length = math::distance(p0, p1);
+  if (!std::isfinite(data.screen_diagonal_length) || data.screen_diagonal_length <= 0.0f) {
+    data.screen_diagonal_length = 1.0f;
+  }
 }
 
 bool camera_data_from_object(const Scene *scene,
@@ -196,29 +244,21 @@ void Camera::sync()
   else if (inst_.drw_view) {
     data.viewmat = inst_.drw_view->viewmat();
     data.viewinv = inst_.drw_view->viewinv();
+    data.winmat = inst_.drw_view->winmat();
 
     if (inst_.is_custom_matrix()) {
       /* If using a custom matrix (XR and some offscreen render paths)
        * we need to use the v3d winmat as-is. */
-      data.winmat = inst_.drw_view->winmat();
-      data.wininv = inst_.drw_view->wininv();
     }
     else {
-      CameraParams params = v3d_camera_params_get();
+      if (film_offset != int2(0) || film_extent != display_extent) {
+        data.winmat = projection_crop_matrix(film_offset, film_extent, display_extent) *
+                      data.winmat;
+      }
 
-      BKE_camera_params_compute_viewplane(&params, UNPACK2(display_extent), 1.0f, 1.0f);
-
-      BLI_assert(BLI_rctf_size_x(&params.viewplane) > 0.0f);
-      BLI_assert(BLI_rctf_size_y(&params.viewplane) > 0.0f);
-
-      BKE_camera_params_crop_viewplane(&params.viewplane, UNPACK2(display_extent), &film_rect);
-
-      RE_GetWindowMatrixWithOverscan(params.is_ortho,
-                                     params.clip_start,
-                                     params.clip_end,
-                                     params.viewplane,
-                                     overscan_,
-                                     data.winmat.ptr());
+      if (overscan_ != 0.0f) {
+        data.winmat = projection_overscan_matrix(film_extent, int2(film_overscan)) * data.winmat;
+      }
     }
   }
   else if (inst_.render) {
@@ -299,6 +339,13 @@ void Camera::update_bounds()
   float left, right, bottom, top, near, far;
   projmat_dimensions(data_.winmat.ptr(), &left, &right, &bottom, &top, &near, &far);
 
+  if (!camera_data_projection_dimensions_valid(
+          this->is_perspective(), left, right, bottom, top, near, far))
+  {
+    camera_data_projection_dimensions_fallback(
+        this->is_perspective(), data_, left, right, bottom, top, near, far);
+  }
+
   BoundBox bbox;
   bbox.vec[0][2] = bbox.vec[3][2] = bbox.vec[7][2] = bbox.vec[4][2] = -near;
   bbox.vec[0][0] = bbox.vec[3][0] = left;
@@ -341,24 +388,43 @@ void Camera::update_bounds()
   float2 p0 = float2(bbox.vec[0]) / (this->is_perspective() ? bbox.vec[0][2] : 1.0f);
   float2 p1 = float2(bbox.vec[7]) / (this->is_perspective() ? bbox.vec[7][2] : 1.0f);
   data_.screen_diagonal_length = math::distance(p0, p1);
+  if (!std::isfinite(data_.screen_diagonal_length) || data_.screen_diagonal_length <= 0.0f) {
+    data_.screen_diagonal_length = 1.0f;
+  }
 }
 
-CameraParams Camera::v3d_camera_params_get() const
+float4x4 Camera::projection_crop_matrix(int2 film_offset, int2 film_extent, int2 display_extent)
 {
-  BLI_assert(inst_.drw_view);
+  float2 uv_min = float2(film_offset) / float2(display_extent);
+  float2 uv_max = float2(film_offset + film_extent) / float2(display_extent);
 
-  CameraParams params;
-  BKE_camera_params_init(&params);
+  float2 ndc_min = uv_min * 2.0f - 1.0f;
+  float2 ndc_max = uv_max * 2.0f - 1.0f;
 
-  if (inst_.rv3d->persp == RV3D_CAMOB && inst_.is_viewport_image_render) {
-    /* We are rendering camera view, no need for pan/zoom params from viewport. */
-    BKE_camera_params_from_object(&params, inst_.camera_eval_object);
-  }
-  else {
-    BKE_camera_params_from_view3d(&params, inst_.depsgraph, inst_.v3d, inst_.rv3d);
-  }
+  float2 ndc_size = ndc_max - ndc_min;
+  float2 ndc_center = (ndc_min + ndc_max) * 0.5f;
 
-  return params;
+  float2 scale = 2.0f / ndc_size;
+  float2 offset = -ndc_center * scale;
+
+  float4x4 crop_matrix = float4x4::identity();
+  crop_matrix[0][0] = scale.x;
+  crop_matrix[1][1] = scale.y;
+  crop_matrix[3][0] = offset.x;
+  crop_matrix[3][1] = offset.y;
+
+  return crop_matrix;
+}
+
+float4x4 Camera::projection_overscan_matrix(int2 film_extent, int2 film_overscan)
+{
+  float2 overscan_scale = float2(film_extent) / float2(film_extent + film_overscan * 2);
+
+  float4x4 overscan_matrix = float4x4::identity();
+  overscan_matrix[0][0] = overscan_scale.x;
+  overscan_matrix[1][1] = overscan_scale.y;
+
+  return overscan_matrix;
 }
 
 /** \} */

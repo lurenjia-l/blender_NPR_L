@@ -13,7 +13,6 @@
 #include "DNA_listBase.h"
 
 #include "BLI_enum_flags.hh"
-#include "BLI_ghash.h"
 
 #include "GPU_material.hh"
 
@@ -176,12 +175,28 @@ struct GPUNodeGraphOutputLink {
   GPUNodeLink *outlink;
 };
 
+enum GPUNodeGraphFunctionLinkMode {
+  GPU_NODE_GRAPH_FUNCTION_LEGACY = 0,
+  GPU_NODE_GRAPH_FUNCTION_MULTI_IO,
+};
+
+struct GPUNodeGraphFunctionOutput {
+  GPUType type;
+  GPUNodeLink *outlink;
+};
+
 struct GPUNodeGraphFunctionLink {
   GPUNodeGraphFunctionLink *next, *prev;
   char name[16];
   char dependency_name[128];
   GPUType return_type;
   GPUNodeLink *outlink;
+
+  GPUNodeGraphFunctionLinkMode mode;
+  GPUType *input_types;
+  int input_types_len;
+  GPUNodeGraphFunctionOutput *outputs;
+  int outputs_len;
 };
 
 struct GPUNodeGraph {
@@ -197,6 +212,8 @@ struct GPUNodeGraph {
   GPUNodeLink *outlink_npr;
   GPUNodeLink *outlink_filter;
   GPUNodeLink *outlink_light_shader;
+  /* List of GPUNodeGraphOutputLink */
+  ListBaseT<GPUNodeGraphOutputLink> outlink_filters;
   /* List of GPUNodeGraphOutputLink */
   ListBaseT<GPUNodeGraphOutputLink> outlink_aovs;
   /* List of GPUNodeGraphOutputLink */
@@ -220,6 +237,7 @@ struct GPUNodeGraph {
 /* Node Graph */
 
 void gpu_nodes_tag(GPUNodeGraph *graph, GPUNodeLink *link_start, GPUNodeTag tag);
+void gpu_node_link_discard(GPUNodeLink *link);
 void gpu_node_graph_prune_unused(GPUNodeGraph *graph);
 void gpu_node_graph_finalize_uniform_attrs(GPUNodeGraph *graph);
 

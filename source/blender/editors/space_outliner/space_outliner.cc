@@ -171,6 +171,11 @@ static void outliner_main_region_listener(const wmRegionListenerParams *params)
         case ND_SCENEBROWSE:
           ED_region_tag_redraw(region);
           break;
+        case ND_RENDER_RESULT:
+          if (space_outliner->outlinevis == SO_EEVEE_PERFORMANCE) {
+            ED_region_tag_redraw(region);
+          }
+          break;
         case ND_LAYER:
           /* Avoid rebuild if only the active collection changes */
           if ((wmn->subtype == NS_LAYER_COLLECTION) && (wmn->action == NA_ACTIVATED)) {
@@ -230,7 +235,14 @@ static void outliner_main_region_listener(const wmRegionListenerParams *params)
       break;
     case NC_SPACE:
       if (wmn->data == ND_SPACE_OUTLINER) {
-        ED_region_tag_redraw(region);
+        /* EEVEE profiler publishes use NA_EDITED so only Performance Outliners rebuild at the
+         * capture cadence. Regular Outliner notifications keep their existing global behavior. */
+        const bool performance_update =
+            wmn->action == NA_EDITED && space_outliner->outlinevis == SO_EEVEE_PERFORMANCE &&
+            (wmn->reference == nullptr || wmn->reference == params->scene);
+        if (wmn->action != NA_EDITED || performance_update) {
+          ED_region_tag_redraw(region);
+        }
       }
       break;
     case NC_ID:
@@ -399,7 +411,7 @@ static SpaceLink *outliner_create(const ScrArea * /*area*/, const Scene * /*scen
   space_outliner->show_restrict_flags = SO_RESTRICT_ENABLE | SO_RESTRICT_HIDE | SO_RESTRICT_RENDER;
   space_outliner->outlinevis = SO_VIEW_LAYER;
   space_outliner->sync_select_dirty |= WM_OUTLINER_SYNC_SELECT_FROM_ALL;
-  space_outliner->flag = SO_SYNC_SELECT | SO_MODE_COLUMN;
+  space_outliner->flag = SO_SYNC_SELECT | SO_MODE_COLUMN | SO_SCROLL_TO_ACTIVE;
   space_outliner->filter = SO_FILTER_NO_VIEW_LAYERS;
 
   /* header */
@@ -423,7 +435,7 @@ static void outliner_free(SpaceLink *sl)
 {
   SpaceOutliner *space_outliner = reinterpret_cast<SpaceOutliner *>(sl);
 
-  outliner_free_tree(&space_outliner->tree);
+  outliner_free_tree(&space_outliner->runtime->tree);
   if (space_outliner->treestore) {
     BLI_mempool_destroy(space_outliner->treestore);
   }
@@ -440,7 +452,7 @@ static SpaceLink *outliner_duplicate(SpaceLink *sl)
   SpaceOutliner *space_outliner_new = MEM_new<SpaceOutliner>(__func__, *space_outliner);
   space_outliner_new->runtime = MEM_new<SpaceOutliner_Runtime>(__func__, *space_outliner->runtime);
 
-  BLI_listbase_clear(&space_outliner_new->tree);
+  space_outliner_new->runtime->tree.clear_no_delete();
   space_outliner_new->treestore = nullptr;
 
   space_outliner_new->sync_select_dirty = WM_OUTLINER_SYNC_SELECT_FROM_ALL;
@@ -541,16 +553,15 @@ static void outliner_space_blend_read_data(BlendDataReader *reader, SpaceLink *s
   SpaceOutliner *space_outliner = reinterpret_cast<SpaceOutliner *>(sl);
   space_outliner->runtime = MEM_new<SpaceOutliner_Runtime>(__func__);
 
-  /* use #BLO_read_get_new_data_address_no_us and do not free old memory avoiding double
+  /* use #BLO_read_struct_no_us and do not free old memory avoiding double
    * frees and use of freed memory. this could happen because of a
    * bug fixed in revision 58959 where the treestore memory address
    * was not unique */
-  TreeStore *ts = static_cast<TreeStore *>(
-      BLO_read_get_new_data_address_no_us(reader, space_outliner->treestore, sizeof(TreeStore)));
+  TreeStore *ts = reinterpret_cast<TreeStore *>(space_outliner->treestore);
   space_outliner->treestore = nullptr;
-  if (ts) {
-    TreeStoreElem *elems = static_cast<TreeStoreElem *>(BLO_read_get_new_data_address_no_us(
-        reader, ts->data, sizeof(TreeStoreElem) * ts->usedelem));
+  if (BLO_read_struct_no_us(reader, TreeStore, &ts)) {
+    TreeStoreElem *elems = ts->data;
+    BLO_read_struct_array_no_us(reader, TreeStoreElem, &elems, ts->usedelem);
 
     space_outliner->treestore = BLI_mempool_create(
         sizeof(TreeStoreElem), ts->usedelem, 512, BLI_MEMPOOL_ALLOW_ITER);
@@ -564,7 +575,7 @@ static void outliner_space_blend_read_data(BlendDataReader *reader, SpaceLink *s
     /* we only saved what was used */
     space_outliner->storeflag |= SO_TREESTORE_CLEANUP; /* at first draw */
   }
-  BLI_listbase_clear(&space_outliner->tree);
+  space_outliner->runtime->tree.clear_no_delete();
 }
 
 static void outliner_space_blend_read_after_liblink(BlendLibReader * /*reader*/,

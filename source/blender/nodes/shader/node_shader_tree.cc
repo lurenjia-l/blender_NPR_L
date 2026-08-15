@@ -65,17 +65,6 @@ static bool shader_tree_poll(const bContext *C, bke::bNodeTreeType * /*treetype*
           !BKE_scene_use_shading_nodes_custom(scene));
 }
 
-static Material *scene_active_filter_material_get(Scene *scene)
-{
-  if (scene == nullptr) {
-    return nullptr;
-  }
-
-  auto *filter_entry = static_cast<SceneFilterMaterial *>(
-      BLI_findlink(&scene->eevee.filter_materials, scene->eevee.active_filter_material_index));
-  return (filter_entry != nullptr) ? filter_entry->material : nullptr;
-}
-
 static void shader_get_from_context(const bContext *C,
                                     bke::bNodeTreeType * /*treetype*/,
                                     bNodeTree **r_ntree,
@@ -83,9 +72,10 @@ static void shader_get_from_context(const bContext *C,
                                     ID **r_from)
 {
   SpaceNode *snode = CTX_wm_space_node(C);
+  const Main *bmain = CTX_data_main(C);
   Scene *scene = CTX_data_scene(C);
   ViewLayer *view_layer = CTX_data_view_layer(C);
-  BKE_view_layer_synced_ensure(scene, view_layer);
+  BKE_view_layer_synced_ensure(*bmain, scene, view_layer);
   Object *ob = BKE_view_layer_active_object_get(view_layer);
 
   if (ELEM(snode->shaderfrom, SNODE_SHADER_OBJECT, SNODE_SHADER_NPR)) {
@@ -140,11 +130,14 @@ static void shader_get_from_context(const bContext *C,
     }
   }
   else if (snode->shaderfrom == SNODE_SHADER_FILTER) {
-    Material *ma = scene_active_filter_material_get(scene);
-    if (ma) {
-      *r_from = nullptr;
-      *r_id = &ma->id;
-      *r_ntree = ma->nodetree;
+    if (snode->id != nullptr && GS(snode->id->name) == ID_MA) {
+      Material *ma = reinterpret_cast<Material *>(snode->id);
+      if (ma->eevee_domain == MA_EEVEE_DOMAIN_FILTER) {
+        *r_from = nullptr;
+        *r_id = &ma->id;
+        *r_ntree = ma->nodetree;
+        return;
+      }
     }
   }
 }
@@ -227,11 +220,12 @@ void register_node_tree_type_sh()
   bke::bNodeTreeType *tt = ntreeType_Shader = MEM_new<bke::bNodeTreeType>(__func__);
 
   tt->type = NTREE_SHADER;
-  tt->idname = "ShaderNodeTree";
-  tt->group_idname = "ShaderNodeGroup";
+  tt->idname = "ShaderNodeTree"_ustr;
+  tt->group_idname = "ShaderNodeGroup"_ustr;
   tt->ui_name = N_("Shader Editor");
   tt->ui_icon = ICON_NODE_MATERIAL;
   tt->ui_description = N_("Edit materials, lights, and world shading using nodes");
+  tt->asset_catalog_path_prefix = "Shading";
 
   tt->foreach_nodeclass = foreach_nodeclass;
   tt->localize = localize;
@@ -326,6 +320,7 @@ static bNodeSocket *ntree_shader_node_output_get(bNode *node, int n)
   return reinterpret_cast<bNodeSocket *>(BLI_findlink(&node->outputs, n));
 }
 
+/* TODO: should be migrated to shader_nodes_inline.c See !153704. */
 static void ntree_shader_unlink_script_nodes(bNodeTree *ntree)
 {
   /* To avoid more trouble in the node tree processing (especially inside
@@ -525,19 +520,16 @@ static bool ntree_weight_tree_tag_nodes(bNode *fromnode, bNode *tonode, void *us
  * with their respective weights. */
 static void ntree_shader_weight_tree_invert(bNodeTree *ntree, bNode *output_node)
 {
-  bNodeLink *displace_link = nullptr;
-  bNodeSocket *displace_output = ntree_shader_node_find_input(output_node, "Displacement");
-  if (displace_output && displace_output->link) {
-    /* Remove any displacement link to avoid tagging it later on. */
-    displace_link = displace_output->link;
-    displace_output->link = nullptr;
-  }
-  bNodeLink *thickness_link = nullptr;
-  bNodeSocket *thickness_output = ntree_shader_node_find_input(output_node, "Thickness");
-  if (thickness_output && thickness_output->link) {
-    /* Remove any thickness link to avoid tagging it later on. */
-    thickness_link = thickness_output->link;
-    thickness_output->link = nullptr;
+  struct DetachedOutputLink {
+    bNodeSocket *socket;
+    bNodeLink *link;
+  };
+  Vector<DetachedOutputLink> detached_output_links;
+  for (bNodeSocket &socket : output_node->inputs) {
+    if (socket.link && socket.type != SOCK_SHADER) {
+      detached_output_links.append({&socket, socket.link});
+      socket.link = nullptr;
+    }
   }
   /* Init tmp flag. */
   for (bNode &node : ntree->nodes) {
@@ -687,6 +679,16 @@ static void ntree_shader_weight_tree_invert(bNodeTree *ntree, bNode *output_node
         }
 
         if (sock.link) {
+          if (ELEM(node.type_legacy,
+                   SH_NODE_SHADERTORGB,
+                   SH_NODE_OUTPUT_LIGHT,
+                   SH_NODE_OUTPUT_WORLD,
+                   SH_NODE_OUTPUT_MATERIAL) &&
+              sock.type != SOCK_SHADER)
+          {
+            continue;
+          }
+
           bNodeSocket *fromsock;
           bNode *fromnode = sock.link->fromnode;
 
@@ -730,9 +732,6 @@ static void ntree_shader_weight_tree_invert(bNodeTree *ntree, bNode *output_node
             case SH_NODE_VOLUME_SCATTER:
             case SH_NODE_VOLUME_COEFFICIENTS:
               fromsock = ntree_shader_node_find_input(fromnode, "Weight");
-              /* Make "weight" sockets available so that links to it are available as well and are
-               * not ignored in other places. */
-              fromsock->flag &= ~SOCK_UNAVAIL;
               if (fromsock->link) {
                 ntree_weight_tree_merge_weight(ntree, fromnode, fromsock, &tonode, &tosock);
               }
@@ -745,25 +744,16 @@ static void ntree_shader_weight_tree_invert(bNodeTree *ntree, bNode *output_node
           /* Manually add the link to the socket to avoid calling:
            * `BKE_ntree_update(G.main, oop)`. */
           fromsock->link = &bke::node_add_link(*ntree, *fromnode, *fromsock, *tonode, *tosock);
-          BLI_assert(fromsock->link);
         }
       }
     }
   }
-  /* Restore displacement & thickness link. */
-  if (displace_link) {
+  for (DetachedOutputLink detached : detached_output_links) {
     bke::node_add_link(*ntree,
-                       *displace_link->fromnode,
-                       *displace_link->fromsock,
+                       *detached.link->fromnode,
+                       *detached.link->fromsock,
                        *output_node,
-                       *displace_output);
-  }
-  if (thickness_link) {
-    bke::node_add_link(*ntree,
-                       *thickness_link->fromnode,
-                       *thickness_link->fromsock,
-                       *output_node,
-                       *thickness_output);
+                       *detached.socket);
   }
   BKE_ntree_update_without_main(*ntree);
 }

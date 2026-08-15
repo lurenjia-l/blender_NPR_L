@@ -16,13 +16,13 @@ namespace nodes::node_shader_input_aov_cc {
 
 static void node_declare(NodeDeclarationBuilder &b)
 {
-  b.add_output<decl::Image>("Color");
-  b.add_output<decl::Image>("Value");
+  b.add_output<decl::Image>("Color"_ustr);
+  b.add_output<decl::Image>("Value"_ustr);
 }
 
-static void node_shader_buts_input_aov(ui::Layout &layout, bContext * /*C*/, PointerRNA *ptr)
+static void node_shader_buts_input_aov(ui::Layout &layout, bContext *C, PointerRNA *ptr)
 {
-  layout.prop(ptr, "aov_name", ui::ITEM_R_SPLIT_EMPTY_NAME, std::nullopt, ICON_NONE);
+  draw_aov_name_search(layout, C, ptr);
 }
 
 static void node_shader_init_input_aov(bNodeTree * /*ntree*/, bNode *node)
@@ -59,7 +59,7 @@ void register_node_type_sh_input_aov()
 
   static bke::bNodeType ntype;
 
-  sh_node_type_base(&ntype, "ShaderNodeInputAOV", SH_NODE_INPUT_AOV);
+  sh_node_type_base(&ntype, "ShaderNodeInputAOV"_ustr, SH_NODE_INPUT_AOV);
   ntype.enum_name_legacy = "INPUT_AOV";
   ntype.ui_name = "AOV Input";
   ntype.ui_description = "Read a view-layer AOV inside the NPR or Filter shader tree";

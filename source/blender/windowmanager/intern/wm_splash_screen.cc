@@ -54,35 +54,40 @@
 
 namespace blender {
 
-#ifdef WITH_BUILDINFO
-extern "C" char build_date[];
-#endif
+extern "C" char build_hash[];
 
 /* -------------------------------------------------------------------- */
 /** \name Splash Screen
  * \{ */
 
+static const char *wm_block_splash_npr_port_label()
+{
+  static char npr_port_label[64] = "";
+
+  if (build_hash[0] != '\0') {
+    BLI_snprintf_utf8(npr_port_label, sizeof(npr_port_label), "NPR Port [%s]", build_hash);
+    return npr_port_label;
+  }
+
+  return "NPR Port";
+}
+
 static const char *wm_block_splash_version_label()
 {
   static char splash_version_label[128] = "";
 
-#ifdef WITH_BUILDINFO
-  if (build_date[0] != '\0') {
-    BLI_snprintf_utf8(
-        splash_version_label, sizeof(splash_version_label), "%s npr post %s", BKE_blender_version_string(), build_date);
-    return splash_version_label;
-  }
-#endif
-
-  BLI_snprintf_utf8(
-      splash_version_label, sizeof(splash_version_label), "%s npr post", BKE_blender_version_string());
+  BLI_snprintf_utf8(splash_version_label,
+                    sizeof(splash_version_label),
+                    "%s %s",
+                    BKE_blender_version_string(),
+                    wm_block_splash_npr_port_label());
   return splash_version_label;
 }
 
-static void wm_block_splash_close(bContext *C, void *arg_block, void * /*arg*/)
+static void wm_block_splash_close(bContext *C, ui::Block *block)
 {
   wmWindow *win = CTX_wm_window(C);
-  popup_block_close(C, win, static_cast<ui::Block *>(arg_block));
+  popup_block_close(C, win, block);
 }
 
 static void wm_block_splash_add_label(ui::Block *block, const char *label, int x, int y)
@@ -108,7 +113,7 @@ static void wm_block_splash_add_label(ui::Block *block, const char *label, int x
 #ifndef WITH_HEADLESS
 static void wm_block_splash_image_roundcorners_add(ImBuf *ibuf)
 {
-  uchar *rct = ibuf->byte_buffer.data;
+  uchar *rct = ibuf->byte_data_for_write();
   if (!rct) {
     return;
   }
@@ -171,14 +176,14 @@ static ImBuf *wm_block_splash_image(int width, int *r_height)
             U.app_template, template_directory, sizeof(template_directory)))
     {
       BLI_path_join(splash_filepath, sizeof(splash_filepath), template_directory, "splash.png");
-      ibuf = IMB_load_image_from_filepath(splash_filepath, IB_byte_data);
+      ibuf = IMB_load_image_from_filepath(splash_filepath, ImBufFlags::ByteData);
     }
   }
 
   if (ibuf == nullptr) {
     const char *custom_splash_path = BLI_getenv("BLENDER_CUSTOM_SPLASH");
     if (custom_splash_path) {
-      ibuf = IMB_load_image_from_filepath(custom_splash_path, IB_byte_data);
+      ibuf = IMB_load_image_from_filepath(custom_splash_path, ImBufFlags::ByteData);
     }
   }
 
@@ -186,11 +191,11 @@ static ImBuf *wm_block_splash_image(int width, int *r_height)
     const uchar *splash_data = reinterpret_cast<const uchar *>(datatoc_splash_png);
     size_t splash_data_size = datatoc_splash_png_size;
     ibuf = IMB_load_image_from_memory(
-        splash_data, splash_data_size, IB_byte_data, "<splash screen>");
+        splash_data, splash_data_size, ImBufFlags::ByteData, "<splash screen>");
   }
 
   if (ibuf) {
-    ibuf->planes = 32; /* The image might not have an alpha channel. */
+    ibuf->color_mode = ImColorMode::RGBA; /* The image might not have an alpha channel. */
     height = (width * ibuf->y) / ibuf->x;
     if (width != ibuf->x || height != ibuf->y) {
       IMB_scale(ibuf, width, height, IMBScaleFilter::Box, false);
@@ -219,14 +224,14 @@ static ImBuf *wm_block_splash_banner_image(int *r_width,
 
   const char *custom_splash_path = BLI_getenv("BLENDER_CUSTOM_SPLASH_BANNER");
   if (custom_splash_path) {
-    ibuf = IMB_load_image_from_filepath(custom_splash_path, IB_byte_data);
+    ibuf = IMB_load_image_from_filepath(custom_splash_path, ImBufFlags::ByteData);
   }
 
   if (!ibuf) {
     return nullptr;
   }
 
-  ibuf->planes = 32; /* The image might not have an alpha channel. */
+  ibuf->color_mode = ImColorMode::RGBA; /* The image might not have an alpha channel. */
 
   width = ibuf->x;
   height = ibuf->y;
@@ -283,7 +288,7 @@ static void wm_block_splash_close_on_fileselect(bContext *C, void *arg1, void * 
   }
 
   if (has_fileselect) {
-    wm_block_splash_close(C, arg1, nullptr);
+    wm_block_splash_close(C, static_cast<ui::Block *>(arg1));
   }
 }
 
@@ -334,7 +339,7 @@ static ui::Block *wm_block_splash_create(bContext *C, ARegion *region, void * /*
     ui::Button *but = uiDefButImage(
         block, ibuf, 0, 0.5f * U.widget_unit, splash_width, splash_height, nullptr);
 
-    button_func_set(but, wm_block_splash_close, block, nullptr);
+    button_func_set(but, [block](bContext &C) { wm_block_splash_close(&C, block); });
 
     wm_block_splash_add_label(block,
                               wm_block_splash_version_label(),
@@ -353,7 +358,7 @@ static ui::Block *wm_block_splash_create(bContext *C, ARegion *region, void * /*
     ui::Button *banner_but = uiDefButImage(
         block, bannerbuf, 0, 0.5f * U.widget_unit, banner_width, banner_height, nullptr);
 
-    button_func_set(banner_but, wm_block_splash_close, block, nullptr);
+    button_func_set(banner_but, [block](bContext &C) { wm_block_splash_close(&C, block); });
   }
 
   const int layout_margin_x = UI_SCALE_FAC * 26;

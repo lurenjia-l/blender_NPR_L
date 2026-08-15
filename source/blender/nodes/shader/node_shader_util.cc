@@ -9,6 +9,7 @@
 #include <optional>
 
 #include "DNA_node_types.h"
+#include "DNA_scene_types.h"
 #include "DNA_space_types.h"
 
 #include "BLI_math_vector.h"
@@ -18,6 +19,12 @@
 #include "BKE_node_runtime.hh"
 
 #include "IMB_colormanagement.hh"
+
+#include "RNA_access.hh"
+#include "RNA_prototypes.hh"
+
+#include "UI_interface_layout.hh"
+#include "UI_resources.hh"
 
 #include "node_shader_util.hh"
 
@@ -64,7 +71,7 @@ static bool common_poll_default(const bke::bNodeType * /*ntype*/,
 }
 
 void sh_node_type_base(bke::bNodeType *ntype,
-                       std::string idname,
+                       UString idname,
                        const std::optional<int16_t> legacy_type)
 {
   bke::node_type_base(*ntype, idname, legacy_type);
@@ -75,7 +82,7 @@ void sh_node_type_base(bke::bNodeType *ntype,
 }
 
 void sh_geo_node_type_base(bke::bNodeType *ntype,
-                           std::string idname,
+                           UString idname,
                            const std::optional<int16_t> legacy_type)
 {
   bke::node_type_base(*ntype, idname, legacy_type);
@@ -86,7 +93,7 @@ void sh_geo_node_type_base(bke::bNodeType *ntype,
 }
 
 void common_node_type_base(bke::bNodeType *ntype,
-                           std::string idname,
+                           UString idname,
                            const std::optional<int16_t> legacy_type)
 {
   sh_node_type_base(ntype, idname, legacy_type);
@@ -188,6 +195,47 @@ bool filter_or_npr_eevee_shader_nodes_poll(const bContext *C)
   return filter_eevee_shader_nodes_poll(C) || npr_shader_nodes_poll(C);
 }
 
+static BIFIconID aov_icon(const ViewLayer &view_layer, PointerRNA &ptr)
+{
+  const std::string aov_name = RNA_string_get(&ptr, "aov_name");
+  if (aov_name.empty()) {
+    return ICON_RECORD_OFF;
+  }
+
+  const ViewLayerAOV *aov = static_cast<const ViewLayerAOV *>(
+      BLI_findstring(&view_layer.aovs, aov_name.c_str(), offsetof(ViewLayerAOV, name)));
+  if (aov == nullptr) {
+    return ICON_RECORD_OFF;
+  }
+
+  switch (aov->type) {
+    case AOV_TYPE_COLOR:
+      return ICON_NODE_SOCKET_RGBA;
+    case AOV_TYPE_VALUE:
+      return ICON_NODE_SOCKET_FLOAT;
+  }
+  return ICON_RECORD_OFF;
+}
+
+void draw_aov_name_search(ui::Layout &layout, bContext *C, PointerRNA *ptr)
+{
+  Scene *scene = CTX_data_scene(C);
+  if (scene == nullptr) {
+    layout.prop(ptr, "aov_name", ui::ITEM_R_SPLIT_EMPTY_NAME, std::nullopt, ICON_NONE);
+    return;
+  }
+
+  ViewLayer *view_layer = CTX_data_view_layer(C);
+  if (view_layer == nullptr) {
+    layout.prop(ptr, "aov_name", ui::ITEM_R_SPLIT_EMPTY_NAME, std::nullopt, ICON_NONE);
+    return;
+  }
+
+  PointerRNA view_layer_rna_ptr = RNA_pointer_create_id_subdata(
+      scene->id, RNA_ViewLayer, view_layer);
+  layout.prop_search(ptr, "aov_name", &view_layer_rna_ptr, "aovs", "", aov_icon(*view_layer, *ptr));
+}
+
 /* ****** */
 
 const bNodeSocket *node_shader_portal_out_source_socket(const bNode &portal_out)
@@ -228,6 +276,9 @@ static void nodestack_get_vec(float *in, short type_in, bNodeStack *ns, const in
     else {
       copy_v3_v3(in, from);
     }
+  }
+  else if (type_in == SOCK_ROTATION) {
+    copy_v4_v4(in, from);
   }
   else { /* type_in==SOCK_RGBA */
     if (ns->sockettype == SOCK_RGBA) {
@@ -298,6 +349,9 @@ void node_gpu_stack_from_data(GPUNodeStack *gs, bNodeSocket *socket, bNodeStack 
     }
     else if (socket->type == SOCK_IMAGE) {
       gs->type = GPU_TEX_HANDLE;
+    }
+    else if (socket->type == SOCK_ROTATION) {
+      gs->type = GPU_VEC4;
     }
     else {
       gs->type = GPU_NONE;
@@ -582,22 +636,9 @@ void get_XYZ_to_RGB_for_gpu(XYZ_to_RGB *data)
   data->b[2] = xyz_to_rgb[2][2];
 }
 
-bool node_socket_not_zero(const GPUNodeStack &socket)
-{
-  return socket.link || socket.vec[0] > 1e-5f;
-}
-bool node_socket_not_white(const GPUNodeStack &socket)
-{
-  return socket.link || socket.vec[0] < 1.0f || socket.vec[1] < 1.0f || socket.vec[2] < 1.0f;
-}
-bool node_socket_not_black(const GPUNodeStack &socket)
-{
-  return socket.link || socket.vec[0] > 1e-5f || socket.vec[1] > 1e-5f || socket.vec[2] > 1e-5f;
-}
-
 void search_link_ops_for_shader_bsdf_node(nodes::GatherLinkSearchOpParams &params)
 {
-  static Set<std::string> skip_socket_identifiers = {"Weight"};
+  static Set<UString> skip_socket_identifiers = {"Weight"_ustr};
   nodes::search_filtered_link_ops_for_basic_node(params, skip_socket_identifiers);
 }
 

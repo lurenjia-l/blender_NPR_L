@@ -58,6 +58,8 @@
 #include "BKE_wm_runtime.hh"
 #include "BKE_workspace.hh"
 
+#include "PRF_profile.hh"
+
 #include "RNA_access.hh"
 #include "RNA_enum_types.hh"
 
@@ -95,12 +97,18 @@
 
 #include "UI_resources.hh"
 
+#ifdef WITH_GHOST_WAYLAND
+#  include "wm_window_icon.hh"
+#endif
+
 /* For assert. */
 #ifndef NDEBUG
 #  include "BLI_threads.h"
 #endif
 
 namespace blender {
+
+extern "C" char build_hash[];
 
 static void wm_window_csd_title_redraw_tag(wmWindowManager *wm, wmWindow *win);
 
@@ -128,7 +136,7 @@ ENUM_OPERATORS(eWinOverrideFlag)
  * Override defaults or startup file when #eWinOverrideFlag is set.
  * These values are typically set by command line arguments.
  */
-static struct WMInitStruct {
+static struct wmInitStruct {
   /**
    * Window geometry:
    * - Defaults to the main screen-size.
@@ -588,6 +596,15 @@ void wm_window_close(bContext *C, wmWindowManager *wm, wmWindow *win)
  * \param window_filepath_fn: When non `nullopt` the title text does not need to contain
  * the file-path (typically based on #WM_CAPABILITY_WINDOW_PATH).
  */
+static std::string wm_window_npr_port_label()
+{
+  if (build_hash[0] != '\0') {
+    return fmt::format("NPR Port [{}]", build_hash);
+  }
+
+  return "NPR Port";
+}
+
 static std::string wm_window_title_text(
     wmWindowManager *wm,
     wmWindow *win,
@@ -684,7 +701,8 @@ static std::string wm_window_title_text(
     }
   }
 
-  win_title.append(fmt::format(" - Blender {}", BKE_blender_version_string()));
+  win_title.append(
+      fmt::format(" - Blender {} {}", BKE_blender_version_string(), wm_window_npr_port_label()));
 
   return win_title;
 }
@@ -1003,9 +1021,7 @@ static void wm_window_ghostwindow_add(wmWindowManager *wm,
 
   GPUBackendType gpu_backend = GPU_backend_type_selection_get();
   gpu_settings.context_type = wm_ghost_drawing_context_type(gpu_backend);
-  gpu_settings.preferred_device.index = U.gpu_preferred_index;
-  gpu_settings.preferred_device.vendor_id = U.gpu_preferred_vendor_id;
-  gpu_settings.preferred_device.device_id = U.gpu_preferred_device_id;
+  gpu_settings.preferred_device = GPU_backend_preferred_device_get();
   if (GPU_backend_vsync_is_overridden()) {
     gpu_settings.flags |= GHOST_gpuVSyncIsOverridden;
     gpu_settings.vsync = GHOST_TVSyncModes(GPU_backend_vsync_get());
@@ -1087,7 +1103,9 @@ static void wm_window_ghostwindow_add(wmWindowManager *wm,
     GPU_render_end();
   }
   else {
-    wm_window_set_drawable(wm, prev_windrawable, false);
+    if (prev_windrawable != nullptr) {
+      wm_window_set_drawable(wm, prev_windrawable, false);
+    }
   }
 }
 
@@ -2191,6 +2209,7 @@ static bool wm_window_timers_process(const bContext *C, int *sleep_us_p)
 
 void wm_window_events_process(const bContext *C)
 {
+  PRF_scope(ProfileCategory::Core);
   BLI_assert(BLI_thread_is_main());
   GPU_render_begin();
 
@@ -2199,6 +2218,8 @@ void wm_window_events_process(const bContext *C)
   if (has_event) {
     g_system->dispatchEvents();
   }
+
+  wm_jobs_handle_finished(C);
 
   /* When there is no event, sleep 5 milliseconds not to use too much CPU when idle. */
   const int sleep_us_default = 5000;
@@ -2301,6 +2322,10 @@ void wm_ghost_init(bContext *C)
   }
 
   g_system->useWindowFocus(wm_init_state.window_focus);
+
+#ifdef WITH_GHOST_WAYLAND
+  g_system->setIconGenerator(&wm_ghost_icon_generator);
+#endif
 
 #ifdef WITH_GHOST_CSD
   if (wm_init_state.window_frame &&
@@ -2815,12 +2840,12 @@ bool WM_clipboard_image_set_byte_buffer(ImBuf *ibuf)
   if (G.background) {
     return false;
   }
-  if (ibuf->byte_buffer.data == nullptr) {
+  if (ibuf->byte_data() == nullptr) {
     return false;
   }
 
   bool success = bool(g_system->putClipboardImage(
-      reinterpret_cast<uint *>(ibuf->byte_buffer.data), ibuf->x, ibuf->y));
+      reinterpret_cast<uint *>(ibuf->byte_data_for_write()), ibuf->x, ibuf->y));
 
   return success;
 }
@@ -3061,8 +3086,18 @@ void WM_cursor_warp(wmWindow *win, int x, int y)
   win->runtime->eventstate->xy[1] = oldy;
 }
 
-uint WM_cursor_preferred_logical_size()
+uint WM_cursor_preferred_logical_size(const bool hardware_cursor)
 {
+  if (OS_MAC) {
+    if (hardware_cursor) {
+      /* On macOS 21 logical pixels is the expected "default", so follow this here.
+       *
+       * NOTE(@ideasman42): visually Blender's cursors do look bigger then the systems
+       * when set to #WM_CURSOR_DEFAULT_LOGICAL_SIZE, so use macOS's default size. */
+      return 21;
+    }
+  }
+
   return g_system->getCursorPreferredLogicalSize();
 }
 
@@ -3400,9 +3435,9 @@ bool WM_window_is_temp_screen(const wmWindow *win)
  * \{ */
 
 #ifdef WITH_INPUT_IME
-void wm_window_IME_begin(wmWindow *win, int x, int y, int w, int h, bool complete)
+void WM_window_IME_begin(wmWindow *win, int x, int y, int w, int h, bool complete)
 {
-  /* NOTE: Keep in mind #wm_window_IME_begin is also used to reposition the IME window. */
+  /* NOTE: Keep in mind #WM_window_IME_begin is also used to reposition the IME window. */
 
   BLI_assert(win);
   if ((WM_capabilities_flag() & WM_CAPABILITY_INPUT_IME) == 0) {
@@ -3417,7 +3452,7 @@ void wm_window_IME_begin(wmWindow *win, int x, int y, int w, int h, bool complet
   ghost_window->beginIME(x, win->sizey - y, w, h, complete);
 }
 
-void wm_window_IME_end(wmWindow *win)
+void WM_window_IME_end(wmWindow *win)
 {
   if ((WM_capabilities_flag() & WM_CAPABILITY_INPUT_IME) == 0) {
     return;
@@ -3428,7 +3463,12 @@ void wm_window_IME_end(wmWindow *win)
    * Even if no IME events were generated (which assigned `ime_data`).
    * TODO: check if #GHOST_EndIME can run on APPLE without causing problems. */
 #  ifdef __APPLE__
-  BLI_assert(win->runtime->ime_data);
+  /* Null when no IME events occurred since the last "end",
+   * common as callers end without checking an IME editor exists,
+   * see #WM_window_IME_region_refresh. */
+  if (win->runtime->ime_data == nullptr) {
+    return;
+  }
 #  endif
 
   GHOST_IWindow *ghost_window = static_cast<GHOST_IWindow *>(win->runtime->ghostwin);
@@ -3437,6 +3477,29 @@ void wm_window_IME_end(wmWindow *win)
   MEM_delete(win->runtime->ime_data);
   win->runtime->ime_data = nullptr;
   win->runtime->ime_data_is_composing = false;
+}
+
+void WM_window_IME_region_refresh(wmWindow *win, const ScrArea *area, const ARegion *region)
+{
+  WM_window_IME_end(win);
+
+  if (!region || !region->runtime->type->cursor_ime) {
+    return;
+  }
+
+  const std::optional<rcti> rect = region->runtime->type->cursor_ime(win, area, region);
+  if (rect) {
+    /* Clamp the caret origin to the region bounds so a cursor scrolled out of view keeps the
+     * IME window at the region edge instead of placing it outside the region. */
+    const int x = region->winrct.xmin +
+                  std::clamp(rect->xmin, 0, BLI_rcti_size_x(&region->winrct));
+    const int y = region->winrct.ymin +
+                  std::clamp(rect->ymin, 0, BLI_rcti_size_y(&region->winrct));
+    const int w = BLI_rcti_size_x(&*rect);
+    const int h = BLI_rcti_size_y(&*rect);
+    /* `WM_window_IME_end` above always ends any session, so this is always a fresh begin. */
+    WM_window_IME_begin(win, x, y, w, h, true);
+  }
 }
 #endif /* WITH_INPUT_IME */
 
@@ -3466,9 +3529,7 @@ GHOST_IContext *WM_system_gpu_context_create()
   if (G.debug & G_DEBUG_GPU) {
     gpu_settings.flags |= GHOST_gpuDebugContext;
   }
-  gpu_settings.preferred_device.index = U.gpu_preferred_index;
-  gpu_settings.preferred_device.vendor_id = U.gpu_preferred_vendor_id;
-  gpu_settings.preferred_device.device_id = U.gpu_preferred_device_id;
+  gpu_settings.preferred_device = GPU_backend_preferred_device_get();
   if (GPU_backend_vsync_is_overridden()) {
     gpu_settings.flags |= GHOST_gpuVSyncIsOverridden;
     gpu_settings.vsync = GHOST_TVSyncModes(GPU_backend_vsync_get());

@@ -44,7 +44,7 @@ void PlanarProbe::set_view(const draw::View &view, int layer_id)
 void PlanarProbeModule::init()
 {
   /* This triggers the compilation of clipped shader only if we can detect light-probe planes. */
-  if (inst_.is_viewport()) {
+  if (inst_.is_viewport() && !inst_.is_image_render) {
     /* This check needs to happen upfront before sync, so we use the previous sync result. */
     update_probes_ = !inst_.light_probes.planar_map_.is_empty();
   }
@@ -55,6 +55,15 @@ void PlanarProbeModule::init()
   }
 
   do_display_draw_ = false;
+
+  eGPUTextureUsage usage = GPU_TEXTURE_USAGE_SHADER_READ;
+  /* Tag the end of the array. */
+  dummy_resources.dummy_probe_planar_buf_[0].layer_id = -1;
+  dummy_resources.dummy_probe_planar_buf_.push_update();
+  dummy_resources.dummy_radiance_tx_.ensure_2d_array(
+      gpu::TextureFormat::UFLOAT_11_11_10, int2(1), 1, usage);
+  dummy_resources.dummy_depth_tx_.ensure_2d_array(
+      gpu::TextureFormat::SFLOAT_32_DEPTH, int2(1), 1, usage);
 }
 
 void PlanarProbeModule::end_sync()
@@ -75,15 +84,20 @@ void PlanarProbeModule::set_view(const draw::View &main_view, int2 main_view_ext
   int2 extent = main_view_extent;
   int layer_count = num_probes;
 
+  const gpu::TextureFormat depth_format = gpu::TextureFormat::SFLOAT_32_DEPTH;
+
   if (num_probes == 0) {
     /* Create valid dummy texture. */
     extent = int2(1);
     layer_count = 1;
   }
+  else {
+    inst_.render_buffers.acquire(extent, depth_format);
+  }
 
   eGPUTextureUsage usage = GPU_TEXTURE_USAGE_ATTACHMENT | GPU_TEXTURE_USAGE_SHADER_READ;
   radiance_tx_.ensure_2d_array(gpu::TextureFormat::UFLOAT_11_11_10, extent, layer_count, usage);
-  depth_tx_.ensure_2d_array(gpu::TextureFormat::SFLOAT_32_DEPTH, extent, layer_count, usage);
+  depth_tx_.ensure_2d_array(depth_format, extent, layer_count, usage);
   radiance_tx_.ensure_layer_views();
   depth_tx_.ensure_layer_views();
 
@@ -109,7 +123,6 @@ void PlanarProbeModule::set_view(const draw::View &main_view, int2 main_view_ext
     world_clip_buf_.push_update();
 
     RenderBuffers &rbufs = inst_.render_buffers;
-
     const bool with_raycast = inst_.pipelines.has_raycast;
     const bool with_prepass_normal = with_raycast || inst_.lights.needs_front_light_shader();
     res.prepass_fb.ensure(
@@ -117,6 +130,7 @@ void PlanarProbeModule::set_view(const draw::View &main_view, int2 main_view_ext
         with_prepass_normal ? GPU_ATTACHMENT_TEXTURE(rbufs.prepass_normal_tx) : GPU_ATTACHMENT_NONE,
         with_raycast ? GPU_ATTACHMENT_TEXTURE(rbufs.object_id_tx) : GPU_ATTACHMENT_NONE,
         GPU_ATTACHMENT_NONE /* motion vectors */);
+
     if (with_raycast) {
       rbufs.object_id_tx.clear(uint4(0));
     }
@@ -153,6 +167,16 @@ void PlanarProbeModule::set_view(const draw::View &main_view, int2 main_view_ext
 
     resource_index++;
   }
+
+  inst_.light_probes.probe_cost_accumulate("Planar Probes",
+                                           "PLANAR",
+                                           resource_index,
+                                           int(num_probes),
+                                           resource_index,
+                                           max_ii(extent.x, extent.y),
+                                           (double(resource_index) * double(extent.x) *
+                                            double(extent.y)) /
+                                               1000000.0);
 
   gbuf.release();
 

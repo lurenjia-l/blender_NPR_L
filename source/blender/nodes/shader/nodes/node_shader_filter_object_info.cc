@@ -8,6 +8,8 @@
 
 #include "node_shader_util.hh"
 
+#include "BLI_math_bits.h"
+
 #include "DNA_object_types.h"
 
 #include "UI_interface_layout.hh"
@@ -20,13 +22,13 @@ namespace nodes::node_shader_filter_object_info_cc {
 static void node_declare(NodeDeclarationBuilder &b)
 {
   b.is_function_node();
-  b.add_output<decl::Vector>("Location")
+  b.add_output<decl::Vector>("Location"_ustr)
       .description("World-space location of the selected object");
-  b.add_output<decl::Vector>("Rotation")
+  b.add_output<decl::Vector>("Rotation"_ustr)
       .description("World-space Euler rotation of the selected object in radians");
-  b.add_output<decl::Vector>("Scale")
+  b.add_output<decl::Vector>("Scale"_ustr)
       .description("World-space scale of the selected object");
-  b.add_output<decl::Color>("Color")
+  b.add_output<decl::Color>("Color"_ustr)
       .description("Viewport display color of the selected object");
 }
 
@@ -43,14 +45,17 @@ static int node_shader_gpu_filter_object_info(GPUMaterial *mat,
                                               GPUNodeStack * /*in*/,
                                               GPUNodeStack *out)
 {
-  const float object_index = float(
-      GPU_material_filter_object_info_ensure(mat, reinterpret_cast<Object *>(node->id)));
+  const float object_uid = uint_as_float(GPU_material_referenced_object_ensure(
+      mat,
+      reinterpret_cast<Object *>(node->id),
+      eGPUReferencedObjectDataFlag(GPU_REFERENCED_OBJECT_DATA_TRANSFORM |
+                                   GPU_REFERENCED_OBJECT_DATA_COLOR)));
   return GPU_stack_link(mat,
                         node,
                         "node_filter_object_info",
                         nullptr,
                         out,
-                        GPU_constant(&object_index));
+                        GPU_constant(&object_uid));
 }
 
 }  // namespace nodes::node_shader_filter_object_info_cc
@@ -61,7 +66,7 @@ void register_node_type_sh_filter_object_info()
 
   static bke::bNodeType ntype;
 
-  sh_node_type_base(&ntype, "ShaderNodeFilterObjectInfo", SH_NODE_FILTER_OBJECT_INFO);
+  sh_node_type_base(&ntype, "ShaderNodeFilterObjectInfo"_ustr, SH_NODE_FILTER_OBJECT_INFO);
   ntype.ui_name = "Filter Object Info";
   ntype.ui_description =
       "Read transform and display color data from a chosen object inside Eevee filter materials";
@@ -70,6 +75,7 @@ void register_node_type_sh_filter_object_info()
   ntype.draw_buttons = file_ns::node_shader_buts_filter_object_info;
   ntype.add_ui_poll = filter_eevee_shader_nodes_poll;
   ntype.gpu_fn = file_ns::node_shader_gpu_filter_object_info;
+  ntype.gpu_uses_referenced_object_data = true;
 
   bke::node_register_type(ntype);
 }

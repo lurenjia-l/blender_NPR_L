@@ -13,9 +13,10 @@ namespace nodes::node_shader_npr_image_sample_cc {
 
 static void node_declare(NodeDeclarationBuilder &b)
 {
-  b.add_input<decl::Image>("Image").hide_value();
-  b.add_input<decl::Vector>("Offset").hide_value();
-  b.add_output<decl::Color>("Color");
+  b.add_input<decl::Image>("Image"_ustr).hide_value();
+  b.add_input<decl::Vector>("Offset"_ustr, "Vector"_ustr).hide_value();
+  b.add_output<decl::Color>("Color"_ustr);
+  b.add_output<decl::Float>("Alpha"_ustr);
 }
 
 static void node_shader_buts(ui::Layout &layout, bContext * /*C*/, PointerRNA *ptr)
@@ -33,8 +34,19 @@ static int node_shader_gpu_npr_image_sample(GPUMaterial *mat,
                                             GPUNodeStack *in,
                                             GPUNodeStack *out)
 {
-  return GPU_stack_link(
-      mat, node, node->custom1 ? "npr_image_sample_texel" : "npr_image_sample_view", in, out);
+  const char *shader_name;
+  switch (node->custom1) {
+    case SHD_IMG_SAMPLE_OFFSET_PIXEL:
+      shader_name = "npr_image_sample_texel";
+      break;
+    case SHD_IMG_SAMPLE_OFFSET_UV:
+      shader_name = "npr_image_sample_uv";
+      break;
+    default:
+      shader_name = "npr_image_sample_view";
+      break;
+  }
+  return GPU_stack_link(mat, node, shader_name, in, out);
 }
 
 }  // namespace nodes::node_shader_npr_image_sample_cc
@@ -45,14 +57,14 @@ void register_node_type_sh_npr_image_sample()
 
   static bke::bNodeType ntype;
 
-  sh_node_type_base(&ntype, "ShaderNodeNPR_ImageSample", SH_NODE_NPR_IMAGE_SAMPLE);
+  sh_node_type_base(&ntype, "ShaderNodeNPR_ImageSample"_ustr, SH_NODE_NPR_IMAGE_SAMPLE);
   ntype.enum_name_legacy = "NPR_IMAGE_SAMPLE";
   ntype.ui_name = "Image Sample";
-  ntype.ui_description = "Sample a TextureHandle within the NPR shader tree";
+  ntype.ui_description = "Sample an NPR or Filter image handle with an optional offset";
   ntype.nclass = NODE_CLASS_INPUT;
   ntype.declare = file_ns::node_declare;
   ntype.draw_buttons = file_ns::node_shader_buts;
-  ntype.add_ui_poll = npr_shader_nodes_poll;
+  ntype.add_ui_poll = filter_or_npr_eevee_shader_nodes_poll;
   ntype.gpu_fn = file_ns::node_shader_gpu_npr_image_sample;
 
   bke::node_register_type(ntype);
