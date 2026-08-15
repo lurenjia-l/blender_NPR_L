@@ -60,6 +60,11 @@ class TOPBAR_HT_upper_bar(Header):
             unlink="scene.view_layer_remove",
         )
 
+        # Scene camera setting, same as the "Camera" property in the Scene tab of
+        # the Properties editor (SCENE_PT_scene).
+        layout.separator(type='LINE')
+        layout.prop(scene, "camera", text="", icon='CAMERA_DATA')
+
 
 class TOPBAR_PT_tool_settings_extra(Panel):
     """
