@@ -125,7 +125,7 @@ void Film::init_aovs(const Set<std::string> &passes_used_by_viewport_compositor)
        * that are connected (its gpu_fn checks in[].link), and the Input reads whatever was
        * written. This avoids bke::node_find_socket, whose topology-cache may not be ready at
        * Film::init time, causing silent skip of the bridge injection. */
-      auto add_bridge = [&](int type, int aov_type) {
+      auto add_bridge = [&](int type, eViewLayerAOVType aov_type) {
         char name[128];
         BKE_npr_bridge_socket_name(&mat, node, type, name, sizeof(name));
         printf("[NPR Bridge] init_aovs register: mat=%s node=%s name=%s hash=%u type=%d\n",

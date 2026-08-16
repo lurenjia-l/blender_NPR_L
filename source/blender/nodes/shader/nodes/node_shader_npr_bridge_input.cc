@@ -31,10 +31,10 @@ namespace nodes::node_shader_npr_bridge_input_cc {
 
 static void node_declare(NodeDeclarationBuilder &b)
 {
-  b.add_output<decl::Image>("Color");
-  b.add_output<decl::Image>("Float");
-  b.add_output<decl::Image>("Vector");
-  b.add_output<decl::Image>("Shader");
+  b.add_output<decl::Image>("Color"_ustr);
+  b.add_output<decl::Image>("Float"_ustr);
+  b.add_output<decl::Image>("Vector"_ustr);
+  b.add_output<decl::Image>("Shader"_ustr);
 }
 
 static void node_shader_buts_npr_bridge_input(ui::Layout &layout,
@@ -167,7 +167,7 @@ void register_node_type_sh_npr_bridge_input()
 
   static bke::bNodeType ntype;
 
-  sh_node_type_base(&ntype, "ShaderNodeNPR_BridgeInput", SH_NODE_NPR_BRIDGE_INPUT);
+  sh_node_type_base(&ntype, "ShaderNodeNPR_BridgeInput"_ustr, SH_NODE_NPR_BRIDGE_INPUT);
   ntype.enum_name_legacy = "NPR_BRIDGE_INPUT";
   ntype.ui_name = "NPR Bridge Input";
   ntype.ui_description = "Read bridged material-tree data inside the NPR shader tree";

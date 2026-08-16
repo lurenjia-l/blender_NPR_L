@@ -24,10 +24,10 @@ namespace nodes::node_shader_npr_bridge_output_cc {
 
 static void node_declare(NodeDeclarationBuilder &b)
 {
-  b.add_input<decl::Color>("Color").default_value({0.0f, 0.0f, 0.0f, 1.0f});
-  b.add_input<decl::Float>("Float").default_value(0.0f);
-  b.add_input<decl::Vector>("Vector").default_value({0.0f, 0.0f, 0.0f});
-  b.add_input<decl::Shader>("Shader");
+  b.add_input<decl::Color>("Color"_ustr).default_value({0.0f, 0.0f, 0.0f, 1.0f});
+  b.add_input<decl::Float>("Float"_ustr).default_value(0.0f);
+  b.add_input<decl::Vector>("Vector"_ustr).default_value({0.0f, 0.0f, 0.0f});
+  b.add_input<decl::Shader>("Shader"_ustr);
 }
 
 static void node_shader_buts_npr_bridge_output(ui::Layout &layout,
@@ -117,7 +117,7 @@ void register_node_type_sh_npr_bridge_output()
 
   static bke::bNodeType ntype;
 
-  sh_node_type_base(&ntype, "ShaderNodeNPR_BridgeOutput", SH_NODE_NPR_BRIDGE_OUTPUT);
+  sh_node_type_base(&ntype, "ShaderNodeNPR_BridgeOutput"_ustr, SH_NODE_NPR_BRIDGE_OUTPUT);
   ntype.enum_name_legacy = "NPR_BRIDGE_OUTPUT";
   ntype.ui_name = "NPR Bridge Output";
   ntype.ui_description =

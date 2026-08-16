@@ -31,7 +31,7 @@ static void node_declare(NodeDeclarationBuilder &b)
   b.add_input<decl::Vector>("Normal"_ustr).hide_value();
   b.add_input<decl::Vector>("Tangent"_ustr).hide_value();
   b.add_input<decl::Float>("Weight"_ustr).available(is_gpu_internal);
-  b.add_input<decl::Int>("Lightgroup ID")
+  b.add_input<decl::Int>("Lightgroup ID"_ustr)
       .default_value(0)
       .min(-1)
       .description("Only lights in this lightgroup illuminate this BSDF");

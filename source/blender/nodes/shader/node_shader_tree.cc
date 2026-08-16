@@ -1055,7 +1055,7 @@ bool npr_bridge_shader_same_chain(bNodeTree *mat_tree, bNode *bridge_output)
   if (mat_tree == nullptr || bridge_output == nullptr) {
     return false;
   }
-  bNodeSocket *bridge_sock = bke::node_find_socket(*bridge_output, SOCK_IN, "Shader");
+  bNodeSocket *bridge_sock = bke::node_find_socket(*bridge_output, SOCK_IN, "Shader"_ustr);
   if (bridge_sock == nullptr || bridge_sock->link == nullptr) {
     return false;
   }
@@ -1066,7 +1066,7 @@ bool npr_bridge_shader_same_chain(bNodeTree *mat_tree, bNode *bridge_output)
   if (mat_output == nullptr) {
     return false;
   }
-  bNodeSocket *surface_sock = bke::node_find_socket(*mat_output, SOCK_IN, "Surface");
+  bNodeSocket *surface_sock = bke::node_find_socket(*mat_output, SOCK_IN, "Surface"_ustr);
   if (surface_sock == nullptr || surface_sock->link == nullptr) {
     return false;
   }

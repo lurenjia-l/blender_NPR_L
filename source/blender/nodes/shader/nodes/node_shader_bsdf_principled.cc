@@ -84,7 +84,7 @@ static void node_declare(NodeDeclarationBuilder &b)
 #define SOCK_NORMAL_ID 6
   b.add_input<decl::Float>("Weight"_ustr).available(is_gpu_internal);
 #define SOCK_WEIGHT_ID 7
-  b.add_input<decl::Int>("Lightgroup ID").default_value(-1).min(-1)
+  b.add_input<decl::Int>("Lightgroup ID"_ustr).default_value(-1).min(-1)
       .description("Only lights in this lightgroup illuminate this BSDF");
 
 #define SOCK_LIGHTGROUP_ID 8
