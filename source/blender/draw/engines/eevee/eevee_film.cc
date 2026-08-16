@@ -128,12 +128,6 @@ void Film::init_aovs(const Set<std::string> &passes_used_by_viewport_compositor)
       auto add_bridge = [&](int type, eViewLayerAOVType aov_type) {
         char name[128];
         BKE_npr_bridge_socket_name(&mat, node, type, name, sizeof(name));
-        printf("[NPR Bridge] init_aovs register: mat=%s node=%s name=%s hash=%u type=%d\n",
-               mat.id.name + 2,
-               node->name,
-               name,
-               BLI_hash_string(name),
-               aov_type);
         ViewLayerAOV *tmp = (ViewLayerAOV *)BLI_memarena_calloc(bridge_arena,
                                                                 sizeof(ViewLayerAOV));
         BLI_strncpy(tmp->name, name, sizeof(tmp->name));

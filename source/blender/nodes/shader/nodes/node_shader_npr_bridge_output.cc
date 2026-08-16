@@ -51,12 +51,6 @@ static int node_shader_gpu_npr_bridge_output(GPUMaterial *mat,
 {
   Material *material = GPU_material_get_material(mat);
   GPU_material_flag_set(mat, GPU_MATFLAG_AOV);
-  printf("[NPR Bridge] Output gpu_fn: node=%s in[0].link=%p in[1].link=%p in[2].link=%p in[3].link=%p\n",
-         node->name,
-         (void *)in[0].link,
-         (void *)in[1].link,
-         (void *)in[2].link,
-         (void *)in[3].link);
 
   /* Color and Float write via node_output_aov using manual GPU_link (not GPU_stack_link, which
    * mis-binds when the node has 4 inputs but node_output_aov only takes color+value). */
@@ -94,10 +88,6 @@ static int node_shader_gpu_npr_bridge_output(GPUMaterial *mat,
     GPUNodeLink *hash_link = GPU_constant(reinterpret_cast<float *>(&hash));
     GPUNodeLink *vec_color = nullptr;
     GPU_link(mat, "npr_bridge_vec_to_color", in[2].link, &vec_color);
-    printf("[NPR Bridge] Output Vector: name=%s hash=%u vec_color=%p\n",
-           name,
-           hash,
-           (void *)vec_color);
     float zero = 0.0f;
     GPUNodeLink *zero_link = GPU_constant(&zero);
     GPUNodeLink *outlink = nullptr;

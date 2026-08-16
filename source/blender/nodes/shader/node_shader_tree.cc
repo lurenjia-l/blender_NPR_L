@@ -1198,17 +1198,6 @@ void ntreeGPUMaterialNodes(bNodeTree *localtree, GPUMaterial *mat)
 {
   bNodeTreeExec *exec;
   const bool is_filter_material = gpu_material_uses_filter_domain(mat);
-  {
-    int bridge_count = 0;
-    for (bNode &n : localtree->nodes) {
-      if (n.type_legacy == SH_NODE_NPR_BRIDGE_OUTPUT) {
-        bridge_count++;
-      }
-    }
-    printf("[NPR Bridge] ntreeGPUMaterialNodes called: is_filter=%d bridge_count=%d\n",
-           is_filter_material,
-           bridge_count);
-  }
 
   ntree_shader_unlink_script_nodes(localtree);
   bke::node_tree_runtime::materialize_shader_portals(*localtree);
